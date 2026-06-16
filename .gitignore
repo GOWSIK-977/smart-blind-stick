@@ -21,3 +21,13 @@ venv.bak/
 *.swo
 *~
 node_modules
+blind_stick.py
+blind_stick_app.py
+blind_stick_app1.py
+blind_stick_apps.py
+template.html
+mp2.txt
+packages.txt
+package.json
+package-lock.json
+test.jpg
