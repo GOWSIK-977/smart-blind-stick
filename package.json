@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "expo-av": "^16.0.8",
+    "expo-location": "^55.1.5-canary-20260328-2049187",
+    "expo-notifications": "^55.0.15-canary-20260328-2049187",
+    "socket.io-client": "^4.8.3"
+  }
+}
