@@ -1,4 +1,4 @@
-# app.py - Complete Working Code for Render with Working Dashboard Links
+# app.py - Complete Working Code for Render - FIXED
 import cv2
 import numpy as np
 import threading
@@ -103,7 +103,6 @@ class SmartBlindStick:
         print(f"   Device ID: {self.device_id}")
         print(f"   YOLO: {'✅ Loaded' if self.model_loaded else '❌ Not Available'}")
         print(f"   Mode: {'☁️ Cloud Mode' if IS_RENDER else '💻 Local Mode'}")
-        print(f"   URL: https://your-app.onrender.com")
         print("="*60 + "\n")
     
     def get_local_ip(self):
@@ -293,7 +292,7 @@ class SmartBlindStick:
         }
 
 # ============================================
-# HTML TEMPLATE - With Working Dashboard Links
+# HTML TEMPLATE - FIXED VERSION
 # ============================================
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
@@ -503,14 +502,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .controls .btn-camera { background: rgba(33,150,243,0.3); color: #2196f3; }
         .controls .btn-camera.active { background: rgba(76,175,80,0.3); color: #4caf50; }
         
-        /* Dashboard Links Section */
         .dashboard-links {
             background: rgba(255,255,255,0.05);
             border-radius: 16px;
             padding: 16px;
             margin: 12px 0;
             border: 1px solid rgba(255,255,255,0.1);
-            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
         }
         .dashboard-links .title {
             font-size: 14px;
@@ -585,22 +582,19 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         </div>
         
         <div class="status-bar">
-            <span id="cameraStatus" class="badge badge-warning">📷 Starting...</span>
+            <span id="cameraStatus" class="badge badge-warning">📷 Click Start</span>
             <span id="gpsStatus" class="badge badge-warning">📍 GPS...</span>
             <span id="serverStatus" class="badge badge-success">🌐 Connected</span>
             <span id="modelStatus" class="badge badge-warning">🤖 Loading...</span>
         </div>
         
-        <!-- Dashboard Links -->
         <div class="dashboard-links">
             <div class="title">🔗 Connection Links</div>
-            
             <div class="link-item">
                 <div class="link-label">📱 Mobile / 💻 Laptop</div>
                 <span class="link-url" id="mainUrl">Loading...</span>
                 <button class="copy-btn" onclick="copyUrl('mainUrl')">📋 Copy</button>
             </div>
-            
             <div class="device-info" id="deviceInfo">Device ID: Loading...</div>
         </div>
         
@@ -666,6 +660,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         let frameCount = 0;
         let retryCount = 0;
         const MAX_RETRIES = 3;
+        let isInitialized = false;
         
         // ============================================
         // COPY URL
@@ -673,14 +668,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         function copyUrl(elementId) {
             const element = document.getElementById(elementId);
             const text = element.textContent;
-            if (text && text !== 'Loading...') {
+            if (text && text !== 'Loading...' && text !== '') {
                 navigator.clipboard.writeText(text).then(() => {
                     const btn = element.parentElement.querySelector('.copy-btn');
                     const originalText = btn.textContent;
                     btn.textContent = '✅ Copied!';
                     setTimeout(() => { btn.textContent = originalText; }, 2000);
                 }).catch(() => {
-                    // Fallback
                     const textArea = document.createElement('textarea');
                     textArea.value = text;
                     document.body.appendChild(textArea);
@@ -689,6 +683,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     document.body.removeChild(textArea);
                     alert('URL copied to clipboard!');
                 });
+            } else {
+                alert('Please wait for URL to load...');
             }
         }
         
@@ -696,16 +692,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         // UPDATE LINKS - IMMEDIATELY
         // ============================================
         function updateLinks() {
-            // Set the URL immediately from window location
             const currentUrl = window.location.href;
             document.getElementById('mainUrl').textContent = currentUrl;
             
-            // Get device info
             fetch('/test')
                 .then(res => res.json())
                 .then(data => {
                     document.getElementById('deviceInfo').textContent = 
                         `Device ID: ${data.device_id || 'Unknown'} | Model: ${data.model_loaded ? '✅' : '❌'}`;
+                    if (data.model_loaded) {
+                        document.getElementById('modelStatus').textContent = '🤖 Active';
+                        document.getElementById('modelStatus').className = 'badge badge-success';
+                    }
                 })
                 .catch(() => {
                     document.getElementById('deviceInfo').textContent = 'Device ID: Connected';
@@ -717,9 +715,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         // ============================================
         async function startCamera() {
             try {
-                if (window.location.protocol !== 'https:' && !window.location.hostname.includes('localhost')) {
-                    console.warn('⚠️ Not running on HTTPS. Camera may not work.');
-                }
+                document.getElementById('cameraStatus').textContent = '📷 Starting...';
+                document.getElementById('cameraStatus').className = 'badge badge-warning';
                 
                 const constraints = {
                     video: {
@@ -756,6 +753,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     setTimeout(startCamera, 2000);
                 } else {
                     alert('Camera access denied. Please:\n1. Use HTTPS (Render URL)\n2. Allow camera permissions\n3. Try Chrome browser');
+                    document.getElementById('cameraStatus').textContent = '📷 Click Start';
+                    document.getElementById('cameraStatus').className = 'badge badge-warning';
                 }
             }
         }
@@ -829,11 +828,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                                 `Model: ${data.debug.model_loaded ? '✅ Loaded' : '❌ Not Loaded'} | ` +
                                 `Frames: ${data.debug.frames_processed} | ` +
                                 `Detections: ${data.debug.total_detections_found}`;
-                            
-                            document.getElementById('modelStatus').textContent = 
-                                data.debug.model_loaded ? '🤖 Active' : '❌ Error';
-                            document.getElementById('modelStatus').className = 
-                                data.debug.model_loaded ? 'badge badge-success' : 'badge badge-danger';
                         }
                     })
                     .catch(err => console.error('Send error:', err));
@@ -867,10 +861,8 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 return;
             }
             
-            if (window.location.protocol !== 'https:' && !window.location.hostname.includes('localhost')) {
-                document.getElementById('gpsStatus').textContent = '⚠️ HTTPS Required';
-                document.getElementById('gpsStatus').className = 'badge badge-danger';
-            }
+            document.getElementById('gpsStatus').textContent = '📍 Getting...';
+            document.getElementById('gpsStatus').className = 'badge badge-warning';
             
             watchId = navigator.geolocation.watchPosition(
                 (position) => {
@@ -893,8 +885,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 },
                 (error) => {
                     console.error('GPS Error:', error);
-                    document.getElementById('gpsStatus').textContent = '⚠️ Error';
-                    document.getElementById('gpsStatus').className = 'badge badge-danger';
+                    document.getElementById('gpsStatus').textContent = '📍 Fallback';
+                    document.getElementById('gpsStatus').className = 'badge badge-warning';
+                    document.getElementById('coordsText').textContent = '11.2745°N, 77.5831°E';
                 },
                 { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
             );
@@ -1007,9 +1000,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             fetch('/stats')
                 .then(res => res.json())
                 .then(data => {
-                    document.getElementById('serverStatus').textContent = '🌐 Connected';
-                    document.getElementById('serverStatus').className = 'badge badge-success';
-                    
                     if (data.person_count !== undefined) {
                         document.getElementById('personCount').textContent = data.person_count;
                         document.getElementById('detectionOverlay').textContent = `👤 ${data.person_count} | 🚗 ${data.vehicle_count || 0}`;
@@ -1028,23 +1018,25 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                             `Detections: ${data.debug.total_detections_found}`;
                     }
                 })
-                .catch(() => {
-                    document.getElementById('serverStatus').textContent = '🌐 Connecting...';
-                    document.getElementById('serverStatus').className = 'badge badge-warning';
-                });
+                .catch(() => {});
         }
         
         // ============================================
         // INITIALIZATION
         // ============================================
         function init() {
-            // Update links immediately on page load
-            updateLinks();
+            if (isInitialized) return;
+            isInitialized = true;
             
-            startGPS();
+            // Update links immediately
+            setTimeout(updateLinks, 500);
             
-            // Auto-start camera
-            setTimeout(startCamera, 1000);
+            // Start GPS
+            setTimeout(startGPS, 1000);
+            
+            // Don't auto-start camera - let user click
+            document.getElementById('cameraStatus').textContent = '📷 Click Start';
+            document.getElementById('cameraStatus').className = 'badge badge-warning';
             
             // Poll server every 2 seconds
             setInterval(pollServer, 2000);
@@ -1054,10 +1046,15 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             
             console.log('✅ System initialized');
             console.log('📱 Open on mobile:', window.location.href);
-            console.log('💻 Open on laptop:', window.location.href);
         }
         
+        // Start when page loads
         document.addEventListener('DOMContentLoaded', init);
+        
+        // Also try on load
+        window.addEventListener('load', function() {
+            setTimeout(updateLinks, 100);
+        });
         
         window.addEventListener('beforeunload', () => {
             if (captureInterval) clearInterval(captureInterval);
@@ -1089,14 +1086,12 @@ def stats():
 
 @app.route('/devices')
 def get_devices():
-    """Get list of all active devices"""
     if blind_stick:
         return jsonify({'devices': device_views})
     return jsonify({'devices': {}})
 
 @app.route('/view/<device_id>')
 def view_device(device_id):
-    """Get shared view of a specific device"""
     if device_id in device_views:
         return jsonify(device_views[device_id])
     return jsonify({'error': 'Device not found'}), 404
@@ -1179,7 +1174,6 @@ def test():
 # ============================================
 
 if __name__ == "__main__":
-    # Initialize system
     blind_stick = SmartBlindStick()
     
     print("\n" + "="*60)
@@ -1193,14 +1187,12 @@ if __name__ == "__main__":
     else:
         print(f"📱 Open on mobile: http://{blind_stick.local_ip}:{PORT}")
         print(f"💻 Open on laptop: http://{blind_stick.local_ip}:{PORT}")
-        print(f"🔄 Localhost: http://127.0.0.1:{PORT}")
     
-    print("\n💡 FEATURES:")
-    print("   📱 Mobile camera as video source")
-    print("   🎯 YOLO object detection")
-    print("   📍 GPS tracking")
-    print("   🚨 Emergency alerts")
-    print("   🔗 Dashboard shows connection links")
+    print("\n💡 HOW TO USE:")
+    print("   1. Open the URL on your mobile")
+    print("   2. Click 'Start Camera'")
+    print("   3. Grant camera permission")
+    print("   4. Point at objects to detect")
     print("="*60 + "\n")
     
     try:
