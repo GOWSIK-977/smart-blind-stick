@@ -103,6 +103,7 @@ class SmartBlindStick:
         print(f"   Device ID: {self.device_id}")
         print(f"   YOLO: {'✅ Loaded' if self.model_loaded else '❌ Not Available'}")
         print(f"   Mode: {'☁️ Cloud Mode' if IS_RENDER else '💻 Local Mode'}")
+        print(f"   Port: {PORT}")
         print("="*60 + "\n")
     
     def get_local_ip(self):
@@ -1196,6 +1197,7 @@ if __name__ == "__main__":
     print("="*60 + "\n")
     
     try:
+        # Bind to 0.0.0.0 to accept connections from anywhere
         app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
