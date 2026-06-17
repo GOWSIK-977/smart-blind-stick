@@ -1,14 +1,11 @@
-# app.py - Complete Smart Blind Stick System for Render Deployment
+# app.py - Fixed for Render Deployment
 import cv2
 import numpy as np
 import threading
 import time
 import queue
 import warnings
-import asyncio
 import json
-import websockets
-import socket
 import requests
 import os
 import base64
@@ -25,39 +22,43 @@ CORS(app)
 
 # Check if running on Render/Cloud
 IS_RENDER = os.environ.get('RENDER', False)
+PORT = int(os.environ.get('PORT', 5000))
 
 class SmartBlindStick:
     def __init__(self):
         print("\n" + "="*60)
-        print("🦯 Initializing Smart Blind Stick System (Render Version)")
+        print("🦯 Initializing Smart Blind Stick System")
         print("="*60)
         
-        # Initialize YOLO
+        # Download and load YOLO model
         print("\n📷 Loading YOLO model...")
         try:
-            if not os.path.exists('yolov8n.pt'):
+            # Download model if not exists
+            model_path = 'yolov8n.pt'
+            if not os.path.exists(model_path):
                 print("   Downloading YOLO model (first time only)...")
-            self.model = YOLO('yolov8n.pt')
+                import urllib.request
+                url = 'https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt'
+                urllib.request.urlretrieve(url, model_path)
+                print("   ✅ Model downloaded!")
+            
+            self.model = YOLO(model_path)
             print("✅ YOLO model loaded!")
         except Exception as e:
             print(f"⚠️ YOLO not available: {e}")
             self.model = None
         
         self.important_classes = {
-            0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 5: 'bus',
-            7: 'truck', 11: 'stop sign'
+            0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 
+            5: 'bus', 7: 'truck', 11: 'stop sign'
         }
         
-        # WebSocket clients
-        self.clients = set()
-        self.current_data = {}
-        self.emergency_mode = False
+        # State variables
         self.person_count = 0
         self.vehicle_count = 0
         self.detected_objects = []
         self.fps = 0
-        self.detection_count = 0
-        self.ws_port = 8765
+        self.emergency_mode = False
         self.last_frame_time = time.time()
         self.frame_count = 0
         
@@ -70,79 +71,69 @@ class SmartBlindStick:
         }
         
         # Frame queue for processing
-        self.frame_queue = queue.Queue(maxsize=10)
-        self.result_queue = queue.Queue(maxsize=10)
+        self.frame_queue = queue.Queue(maxsize=5)
+        self.result_queue = queue.Queue(maxsize=5)
         self.processing = False
+        self.last_detection = []
+        self.last_update_time = time.time()
         
         # Start processing thread
         threading.Thread(target=self.process_frames, daemon=True).start()
         
         print("\n" + "="*60)
         print("✅ SYSTEM READY!")
-        print(f"   Camera: 📱 Mobile Camera Mode")
         print(f"   YOLO: {'✅ Loaded' if self.model else '⚠️ Not Available'}")
         print(f"   Mode: {'☁️ Cloud Mode' if IS_RENDER else '💻 Local Mode'}")
         print("="*60 + "\n")
     
     def process_frames(self):
-        """Process frames from mobile in background"""
+        """Process frames in background"""
         self.processing = True
         
         while self.processing:
             try:
                 # Get frame from queue
-                frame_data = self.frame_queue.get(timeout=1)
+                frame_data = self.frame_queue.get(timeout=0.5)
                 if frame_data is None:
                     continue
                 
                 # Decode image
-                image_bytes = base64.b64decode(frame_data)
-                np_arr = np.frombuffer(image_bytes, np.uint8)
-                frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                
-                if frame is None:
-                    continue
-                
-                # Process with YOLO
-                processed_frame, detections = self.detect_with_yolo(frame)
-                
-                # Update stats
-                self.person_count = sum(1 for d in detections if d['class'] == 'person')
-                self.vehicle_count = sum(1 for d in detections if d['class'] in ['car', 'truck', 'bus', 'bicycle', 'motorcycle'])
-                self.detected_objects = detections
-                self.detection_count += len(detections)
-                
-                # Calculate FPS
-                self.frame_count += 1
-                if self.frame_count % 10 == 0:
+                try:
+                    image_bytes = base64.b64decode(frame_data)
+                    np_arr = np.frombuffer(image_bytes, np.uint8)
+                    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+                    
+                    if frame is None:
+                        continue
+                    
+                    # Process with YOLO
+                    detections = self.detect_with_yolo(frame)
+                    
+                    # Update stats
+                    self.person_count = sum(1 for d in detections if d['class'] == 'person')
+                    self.vehicle_count = sum(1 for d in detections if d['class'] in ['car', 'truck', 'bus', 'bicycle', 'motorcycle'])
+                    self.detected_objects = detections
+                    
+                    # Calculate FPS
+                    self.frame_count += 1
                     current_time = time.time()
-                    self.fps = int(10 / (current_time - self.last_frame_time)) if (current_time - self.last_frame_time) > 0 else 30
-                    self.last_frame_time = current_time
-                
-                # Prepare result
-                result = {
-                    'detections': detections,
-                    'person_count': self.person_count,
-                    'vehicle_count': self.vehicle_count,
-                    'fps': self.fps,
-                    'emergency': self.emergency_mode,
-                    'location': self.current_location,
-                    'timestamp': datetime.now().isoformat(),
-                    'connected_clients': len(self.clients),
-                    'detection_count': self.detection_count,
-                    'processed': True
-                }
-                
-                # Put result in queue
-                self.result_queue.put(result)
-                
-                # Update current data
-                self.current_data = result
-                
+                    if current_time - self.last_frame_time > 1.0:
+                        self.fps = self.frame_count
+                        self.frame_count = 0
+                        self.last_frame_time = current_time
+                    
+                    # Store result
+                    self.last_detection = detections
+                    self.last_update_time = time.time()
+                    
+                except Exception as e:
+                    print(f"Frame processing error: {e}")
+                    continue
+                    
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"⚠️ Frame processing error: {e}")
+                print(f"Unexpected error in process_frames: {e}")
                 continue
     
     def detect_with_yolo(self, frame):
@@ -151,10 +142,10 @@ class SmartBlindStick:
         height, width = frame.shape[:2]
         
         if self.model is None:
-            return frame, detections
+            return detections
         
         try:
-            results = self.model(frame, stream=True, conf=0.5, verbose=False)
+            results = self.model(frame, stream=True, conf=0.3, verbose=False)
             
             for r in results:
                 boxes = r.boxes
@@ -163,7 +154,7 @@ class SmartBlindStick:
                         cls = int(box.cls[0])
                         conf = float(box.conf[0])
                         
-                        if conf < 0.5:
+                        if conf < 0.3:
                             continue
                         
                         class_name = self.important_classes.get(cls, f"object_{cls}")
@@ -175,19 +166,15 @@ class SmartBlindStick:
                         if box_height > height * 0.5:
                             distance = "very close"
                             distance_cm = 30
-                            color = (0, 0, 255)
                         elif box_height > height * 0.3:
                             distance = "close"
                             distance_cm = 60
-                            color = (0, 165, 255)
                         elif box_height > height * 0.15:
                             distance = "medium"
                             distance_cm = 120
-                            color = (0, 255, 255)
                         else:
                             distance = "far"
                             distance_cm = 200
-                            color = (0, 255, 0)
                         
                         # Determine direction
                         center_x = (x1 + x2) / 2
@@ -203,220 +190,37 @@ class SmartBlindStick:
                             'confidence': conf,
                             'distance': distance,
                             'distance_cm': distance_cm,
-                            'direction': direction,
-                            'bbox': (x1, y1, x2, y2)
+                            'direction': direction
                         }
                         detections.append(detection)
-                        
-                        # Draw on frame
-                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                        label = f"{class_name}: {conf:.2f} ({distance}, {direction})"
-                        cv2.putText(frame, label, (x1, y1-10), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
             
         except Exception as e:
             print(f"Detection error: {e}")
         
-        return frame, detections
+        return detections
     
-    async def handle_client(self, websocket):
-        """Handle WebSocket client"""
-        self.clients.add(websocket)
-        print(f"📱 Mobile connected! Total: {len(self.clients)}")
-        
-        try:
-            # Send initial data
-            if self.current_data:
-                await websocket.send(json.dumps(self.current_data))
-            
-            async for message in websocket:
-                try:
-                    data = json.loads(message)
-                    msg_type = data.get('type')
-                    
-                    if msg_type == 'register':
-                        await websocket.send(json.dumps({'type': 'registered', 'status': 'ok'}))
-                    
-                    elif msg_type == 'frame':
-                        # Process frame from mobile
-                        image_data = data.get('image', '')
-                        if image_data and ',' in image_data:
-                            # Remove data URL prefix
-                            image_data = image_data.split(',')[1]
-                            try:
-                                # Add to queue for processing
-                                if self.frame_queue.qsize() < 10:
-                                    self.frame_queue.put(image_data)
-                                    
-                                    # Get result if available
-                                    try:
-                                        result = self.result_queue.get_nowait()
-                                        await websocket.send(json.dumps(result))
-                                    except queue.Empty:
-                                        pass
-                            except Exception as e:
-                                print(f"Frame processing error: {e}")
-                    
-                    elif msg_type == 'location_update':
-                        lat = data.get('lat')
-                        lng = data.get('lng')
-                        address = data.get('address')
-                        if lat is not None and lng is not None:
-                            self.current_location = {
-                                "lat": lat,
-                                "lng": lng,
-                                "address": address or f"{lat:.6f}, {lng:.6f}",
-                                "source": "mobile_gps"
-                            }
-                            print(f"📍 Location updated: {self.current_location['address']}")
-                    
-                    elif msg_type == 'emergency':
-                        await self.handle_emergency_request(websocket)
-                
-                except json.JSONDecodeError:
-                    print("⚠️ Invalid JSON received")
-                except Exception as e:
-                    print(f"Error processing message: {e}")
-        
-        except websockets.exceptions.ConnectionClosed:
-            print("📱 Mobile disconnected")
-        except Exception as e:
-            print(f"WebSocket error: {e}")
-        finally:
-            self.clients.discard(websocket)
-            print(f"📱 Mobile disconnected. Total: {len(self.clients)}")
-    
-    async def handle_emergency_request(self, websocket=None):
-        """Handle emergency alert"""
-        self.emergency_mode = True
-        maps_url = f"https://www.google.com/maps?q={self.current_location['lat']},{self.current_location['lng']}"
-        
-        emergency_data = {
-            'type': 'emergency',
-            'title': '🚨 EMERGENCY ALERT! 🚨',
-            'message': 'Emergency button pressed! Immediate assistance needed!',
-            'location': self.current_location,
-            'maps_url': maps_url,
+    def get_current_data(self):
+        """Get current detection data"""
+        return {
+            'detections': self.last_detection[:15],
             'person_count': self.person_count,
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            'vehicle_count': self.vehicle_count,
+            'fps': self.fps,
+            'emergency': self.emergency_mode,
+            'location': self.current_location,
+            'timestamp': datetime.now().isoformat(),
+            'total_detections': len(self.last_detection)
         }
-        
-        print(f"\n{'='*60}")
-        print("🚨 EMERGENCY ALERT SENT!")
-        print(f"{'='*60}")
-        print(f"📍 Location: {self.current_location['address']}")
-        print(f"📍 Coordinates: {self.current_location['lat']}, {self.current_location['lng']}")
-        print(f"📍 Google Maps: {maps_url}")
-        print(f"👥 Persons detected: {self.person_count}")
-        
-        # Broadcast to all clients
-        if self.clients:
-            for client in list(self.clients):
-                try:
-                    await client.send(json.dumps(emergency_data))
-                    print("✅ Alert sent to mobile")
-                except Exception as e:
-                    print(f"❌ Failed to send to client: {e}")
-        
-        print(f"{'='*60}\n")
-        
-        # Reset emergency after 30 seconds
-        def reset_emergency():
-            time.sleep(30)
-            self.emergency_mode = False
-            print("🔴 Emergency mode reset")
-        
-        threading.Thread(target=reset_emergency, daemon=True).start()
-        
-        return emergency_data
-    
-    async def broadcast_updates(self):
-        """Broadcast updates to all connected clients"""
-        while True:
-            if self.clients and self.current_data:
-                dead_clients = set()
-                for client in list(self.clients):
-                    try:
-                        await client.send(json.dumps(self.current_data))
-                    except:
-                        dead_clients.add(client)
-                
-                for client in dead_clients:
-                    self.clients.discard(client)
-            
-            await asyncio.sleep(0.1)
-    
-    def run_websocket(self):
-        """Run WebSocket server"""
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self.ws_loop = loop
-        
-        async def server():
-            # Try ports from 8765 to 8784
-            for port in range(8765, 8785):
-                try:
-                    async with websockets.serve(self.handle_client, '0.0.0.0', port):
-                        self.ws_port = port
-                        print(f"🔌 WebSocket server running on ws://0.0.0.0:{port}")
-                        await asyncio.gather(self.broadcast_updates(), asyncio.Future())
-                    break
-                except OSError as e:
-                    if "address already in use" in str(e).lower() or "10048" in str(e):
-                        print(f"⚠️ Port {port} in use, trying {port + 1}...")
-                        continue
-                    else:
-                        print(f"❌ WebSocket error: {e}")
-                        raise
-        
-        loop.run_until_complete(server())
-    
-    def run(self):
-        """Start the system"""
-        ws_thread = threading.Thread(target=self.run_websocket, daemon=True)
-        ws_thread.start()
-        
-        # Wait for WebSocket to start
-        time.sleep(1)
-        
-        print("\n" + "="*60)
-        print("🌐 SERVER RUNNING!")
-        print("="*60)
-        
-        hostname = socket.gethostname()
-        local_ip = socket.gethostbyname(hostname)
-        
-        if IS_RENDER:
-            print("📱 Open on your mobile: https://your-app.onrender.com")
-            print("💻 Or use the Render URL")
-        else:
-            print(f"📱 Open on your MOBILE PHONE: http://{local_ip}:5000")
-            print(f"💻 Open on this computer: http://127.0.0.1:5000")
-        
-        print(f"🔌 WebSocket: ws://0.0.0.0:{self.ws_port}")
-        print("\n💡 FEATURES:")
-        print("   📱 Mobile camera as video source")
-        print("   🎯 YOLO object detection (persons, vehicles, etc.)")
-        print("   📍 GPS tracking via mobile browser")
-        print("   🚨 Emergency alerts with location")
-        print("   👥 Multi-user support")
-        print("="*60 + "\n")
-    
-    def cleanup(self):
-        """Cleanup resources"""
-        self.processing = False
-        if hasattr(self, 'ws_loop'):
-            self.ws_loop.stop()
 
 # ============================================
-# HTML TEMPLATE WITH MOBILE CAMERA SUPPORT
+# HTML TEMPLATE - Fixed for Render
 # ============================================
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-    <title>Smart Blind Stick - Mobile Camera</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Smart Blind Stick</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
@@ -425,6 +229,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             min-height: 100vh;
             padding: 12px;
             color: #fff;
+            touch-action: manipulation;
         }
         .container { max-width: 500px; margin: 0 auto; }
         
@@ -433,7 +238,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             padding: 10px 0 15px 0;
         }
         .header h1 { font-size: 22px; background: linear-gradient(135deg, #4caf50, #2196f3); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .header .subtitle { font-size: 12px; opacity: 0.6; -webkit-text-fill-color: #888; }
+        .header .subtitle { font-size: 12px; opacity: 0.6; color: #888; }
         
         .status-bar {
             display: flex;
@@ -492,10 +297,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             font-size: 11px;
             color: #4caf50;
         }
-        .video-overlay .fps {
-            color: #4caf50;
-            font-weight: bold;
-        }
+        .video-overlay .fps { color: #4caf50; font-weight: bold; }
         .video-placeholder {
             display: flex;
             flex-direction: column;
@@ -520,6 +322,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             margin-bottom: 12px;
             animation: pulse 2s infinite;
             box-shadow: 0 4px 20px rgba(255,68,68,0.3);
+            touch-action: manipulation;
         }
         @keyframes pulse {
             0%,100% { transform: scale(1); box-shadow: 0 4px 20px rgba(255,68,68,0.3); }
@@ -577,42 +380,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .location-card .label { font-size: 11px; opacity: 0.6; }
         .location-card .address { font-size: 14px; font-weight: 500; margin: 4px 0; }
         .location-card .coords { font-size: 12px; opacity: 0.7; }
-        .location-card .accuracy { font-size: 11px; opacity: 0.5; }
-        .location-actions {
-            display: flex;
-            gap: 8px;
-            margin-top: 8px;
-        }
-        .location-actions button {
-            flex: 1;
-            padding: 8px;
-            border: none;
-            border-radius: 8px;
-            font-size: 12px;
-            font-weight: 600;
-            cursor: pointer;
-        }
-        .btn-maps { background: #4caf50; color: white; }
-        .btn-location { background: #2196f3; color: white; }
-        
-        .alert-list {
-            max-height: 100px;
-            overflow-y: auto;
-            background: rgba(255,255,255,0.05);
-            border-radius: 12px;
-            padding: 8px;
-            border: 1px solid rgba(255,255,255,0.05);
-        }
-        .alert-item {
-            padding: 4px 8px;
-            font-size: 12px;
-            border-left: 2px solid #ff9800;
-            margin: 4px 0;
-            background: rgba(255,255,255,0.03);
-            border-radius: 4px;
-        }
-        .alert-item.emergency { border-left-color: #f44336; background: rgba(244,67,54,0.1); }
-        .alert-item .time { opacity: 0.5; font-size: 10px; }
         
         .controls {
             display: flex;
@@ -629,6 +396,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             cursor: pointer;
             background: rgba(255,255,255,0.1);
             color: white;
+            touch-action: manipulation;
         }
         .controls button:active { transform: scale(0.95); }
         .controls .btn-camera { background: rgba(33,150,243,0.3); color: #2196f3; }
@@ -651,9 +419,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         
         <!-- Status -->
         <div class="status-bar">
-            <span id="wsStatus" class="badge badge-warning">🔌 Connecting...</span>
             <span id="cameraStatus" class="badge badge-warning">📷 Starting...</span>
             <span id="gpsStatus" class="badge badge-warning">📍 GPS...</span>
+            <span id="serverStatus" class="badge badge-warning">🌐 Connecting...</span>
         </div>
         
         <!-- Video Container -->
@@ -705,16 +473,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="label">📍 Current Location</div>
             <div class="address" id="addressText">Getting location...</div>
             <div class="coords" id="coordsText">11.2745°N, 77.5831°E</div>
-            <div class="accuracy" id="accuracyText">Accuracy: ±0m</div>
-            <div class="location-actions">
-                <button class="btn-maps" onclick="openGoogleMaps()">🗺️ Open Maps</button>
-                <button class="btn-location" onclick="centerLocation()">📍 Center</button>
+            <div style="margin-top:8px;display:flex;gap:8px;">
+                <button onclick="openGoogleMaps()" style="flex:1;padding:8px;border:none;border-radius:8px;background:#4caf50;color:#fff;font-size:12px;font-weight:600;cursor:pointer;">🗺️ Open Maps</button>
             </div>
-        </div>
-        
-        <!-- Alerts -->
-        <div class="alert-list" id="alertList">
-            <div style="text-align:center; opacity:0.5; padding:5px; font-size:12px;">No alerts</div>
         </div>
     </div>
     
@@ -724,75 +485,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         // ============================================
         let video = document.getElementById('video');
         let stream = null;
-        let ws = null;
         let isCameraOn = false;
         let facingMode = 'environment';
         let captureInterval = null;
         let lastFrameTime = Date.now();
         let frameCount = 0;
-        
-        // ============================================
-        // WEBSOCKET CONNECTION
-        // ============================================
-        function connectWebSocket() {
-            const wsPorts = [8765, 8766, 8767, 8768, 8769, 8770, 8771, 8772, 8773, 8774];
-            let portIndex = 0;
-            
-            function tryConnect() {
-                if (portIndex >= wsPorts.length) {
-                    document.getElementById('wsStatus').textContent = '❌ Connection Failed';
-                    document.getElementById('wsStatus').className = 'badge badge-danger';
-                    setTimeout(tryConnect, 5000);
-                    return;
-                }
-                
-                const port = wsPorts[portIndex];
-                const wsUrl = `ws://${window.location.hostname}:${port}`;
-                console.log('🔌 Connecting to WebSocket:', wsUrl);
-                
-                try {
-                    ws = new WebSocket(wsUrl);
-                    
-                    ws.onopen = () => {
-                        console.log('✅ WebSocket connected on port', port);
-                        document.getElementById('wsStatus').textContent = '🔌 Connected';
-                        document.getElementById('wsStatus').className = 'badge badge-success';
-                        ws.send(JSON.stringify({ type: 'register' }));
-                        addAlert('System', 'Connected to server');
-                        portIndex = 0; // Reset on success
-                    };
-                    
-                    ws.onmessage = (event) => {
-                        try {
-                            const data = JSON.parse(event.data);
-                            updateUI(data);
-                        } catch(e) {
-                            console.error('Parse error:', e);
-                        }
-                    };
-                    
-                    ws.onclose = () => {
-                        console.log('❌ WebSocket disconnected');
-                        document.getElementById('wsStatus').textContent = '🔌 Disconnected';
-                        document.getElementById('wsStatus').className = 'badge badge-danger';
-                        portIndex++;
-                        setTimeout(tryConnect, 3000);
-                    };
-                    
-                    ws.onerror = () => {
-                        console.log('WebSocket error, trying next port');
-                        ws.close();
-                    };
-                    
-                } catch(e) {
-                    console.log('Connection error:', e);
-                    portIndex++;
-                    setTimeout(tryConnect, 3000);
-                }
-            }
-            
-            tryConnect();
-        }
+        let serverUrl = window.location.origin;
         
         // ============================================
         // CAMERA
@@ -822,7 +520,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 // Start sending frames
                 startFrameCapture();
                 
-                addAlert('Camera', 'Camera started successfully');
                 console.log('📷 Camera started');
                 
             } catch(err) {
@@ -830,7 +527,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 document.getElementById('cameraStatus').textContent = '❌ Camera Error';
                 document.getElementById('cameraStatus').className = 'badge badge-danger';
                 alert('Camera access denied. Please allow camera permissions.');
-                addAlert('Error', 'Camera access denied');
             }
         }
         
@@ -870,7 +566,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 stopCamera();
                 setTimeout(startCamera, 500);
             }
-            addAlert('Camera', `Switched to ${facingMode === 'environment' ? 'back' : 'front'} camera`);
         }
         
         // ============================================
@@ -895,15 +590,16 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                     
                     // Compress to JPEG
-                    const imageData = canvas.toDataURL('image/jpeg', 0.7);
+                    const imageData = canvas.toDataURL('image/jpeg', 0.6);
                     
-                    // Send to server via WebSocket
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({
-                            type: 'frame',
-                            image: imageData
-                        }));
-                    }
+                    // Send to server via HTTP POST (more reliable than WebSocket on Render)
+                    fetch('/process_frame', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ image: imageData })
+                    }).then(res => res.json())
+                      .then(data => updateUI(data))
+                      .catch(err => console.error('Frame send error:', err));
                     
                     // Update FPS
                     frameCount++;
@@ -918,7 +614,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 } catch(e) {
                     console.error('Frame capture error:', e);
                 }
-            }, 100); // 10 FPS
+            }, 150); // ~7 FPS for better performance
             
             console.log('📷 Frame capture started');
         }
@@ -946,21 +642,15 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     
                     document.getElementById('coordsText').textContent = 
                         `${lat.toFixed(6)}°N, ${lng.toFixed(6)}°E`;
-                    document.getElementById('accuracyText').textContent = 
-                        `Accuracy: ±${Math.round(accuracy)}m`;
                     document.getElementById('gpsStatus').textContent = '📍 GPS Active';
                     document.getElementById('gpsStatus').className = 'badge badge-success';
                     
                     // Send to server
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({
-                            type: 'location_update',
-                            lat: lat,
-                            lng: lng,
-                            address: `${lat.toFixed(6)}, ${lng.toFixed(6)}`,
-                            accuracy: accuracy
-                        }));
-                    }
+                    fetch('/location', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ lat, lng })
+                    }).catch(() => {});
                     
                     // Reverse geocode
                     reverseGeocode(lat, lng);
@@ -969,7 +659,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 },
                 (error) => {
                     console.error('GPS Error:', error);
-                    document.getElementById('gpsStatus').textContent = `⚠️ GPS Error`;
+                    document.getElementById('gpsStatus').textContent = '⚠️ GPS Error';
                     document.getElementById('gpsStatus').className = 'badge badge-danger';
                 },
                 { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
@@ -992,14 +682,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 });
         }
         
-        function centerLocation() {
-            if (currentLocation) {
-                document.getElementById('coordsText').textContent = 
-                    `${currentLocation.lat.toFixed(6)}°N, ${currentLocation.lng.toFixed(6)}°E`;
-                addAlert('Location', 'Location centered');
-            }
-        }
-        
         function openGoogleMaps() {
             const lat = currentLocation.lat;
             const lng = currentLocation.lng;
@@ -1011,6 +693,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         // UI UPDATE
         // ============================================
         function updateUI(data) {
+            if (!data) return;
+            
+            // Update server status
+            document.getElementById('serverStatus').textContent = '🌐 Connected';
+            document.getElementById('serverStatus').className = 'badge badge-success';
+            
             // Stats
             if (data.person_count !== undefined) {
                 document.getElementById('personCount').textContent = data.person_count;
@@ -1019,17 +707,14 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             if (data.vehicle_count !== undefined) {
                 document.getElementById('vehicleCount').textContent = data.vehicle_count;
             }
-            if (data.fps !== undefined) {
+            if (data.fps !== undefined && data.fps > 0) {
                 document.getElementById('fpsValue').textContent = data.fps;
-                if (!document.getElementById('fpsOverlay').textContent || document.getElementById('fpsOverlay').textContent === '0') {
-                    document.getElementById('fpsOverlay').textContent = data.fps;
-                }
             }
             
             // Detections
             if (data.detections && data.detections.length > 0) {
                 let html = '';
-                data.detections.slice(0, 15).forEach(d => {
+                data.detections.forEach(d => {
                     const emoji = d.class === 'person' ? '👤' : 
                                   (d.class.includes('car') || d.class.includes('vehicle') ? '🚗' : 
                                   (d.class === 'bicycle' ? '🚲' : '📦'));
@@ -1043,29 +728,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     </div>`;
                 });
                 document.getElementById('detectionList').innerHTML = html;
-            } else if (data.detections !== undefined) {
+            } else {
                 document.getElementById('detectionList').innerHTML = 
                     '<div style="text-align:center; opacity:0.5; padding:10px; font-size:13px;">No objects detected</div>';
             }
             
             // Location
             if (data.location) {
-                currentLocation = data.location;
                 document.getElementById('coordsText').textContent = 
                     `${data.location.lat.toFixed(6)}°N, ${data.location.lng.toFixed(6)}°E`;
                 if (data.location.address) {
                     document.getElementById('addressText').textContent = data.location.address;
                 }
-            }
-            
-            // Emergency
-            if (data.type === 'emergency') {
-                handleEmergency(data);
-            }
-            
-            // Arduino status
-            if (data.arduino_connected !== undefined) {
-                // Optional: display Arduino status
             }
         }
         
@@ -1076,7 +750,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             if (!confirm('🚨 Send emergency alert with your location?')) return;
             
             try {
-                addAlert('Emergency', 'Sending emergency alert...', true);
                 document.querySelector('.emergency-btn').textContent = '🚨 SENDING...';
                 document.querySelector('.emergency-btn').disabled = true;
                 
@@ -1084,91 +757,66 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 const data = await response.json();
                 
                 if (data.status === 'success') {
-                    addAlert('EMERGENCY', '🚨 Emergency alert sent successfully!', true);
+                    alert('🚨 Emergency alert sent successfully!');
                     if (navigator.vibrate) navigator.vibrate([500, 300, 500]);
                     
-                    // Open maps
                     setTimeout(() => {
                         if (confirm('🚨 Open Google Maps for location?')) {
                             openGoogleMaps();
                         }
                     }, 1000);
                 } else {
-                    addAlert('Error', 'Failed to send emergency alert');
+                    alert('Failed to send emergency alert');
                 }
             } catch(e) {
                 console.error('Emergency error:', e);
-                addAlert('Error', 'Network error sending emergency');
+                alert('Network error sending emergency');
             } finally {
                 document.querySelector('.emergency-btn').textContent = '🚨 EMERGENCY';
                 document.querySelector('.emergency-btn').disabled = false;
             }
         }
         
-        function handleEmergency(data) {
-            addAlert(data.title || 'EMERGENCY', data.message || 'Emergency alert received!', true);
-            if (navigator.vibrate) navigator.vibrate([500, 300, 500, 300, 500]);
-            
-            if (data.maps_url) {
-                setTimeout(() => {
-                    if (confirm('🚨 EMERGENCY! Open Google Maps?')) {
-                        window.open(data.maps_url, '_blank');
+        // ============================================
+        // POLL SERVER FOR UPDATES
+        // ============================================
+        function pollServer() {
+            fetch('/stats')
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('serverStatus').textContent = '🌐 Connected';
+                    document.getElementById('serverStatus').className = 'badge badge-success';
+                    
+                    // Update stats
+                    if (data.person_count !== undefined) {
+                        document.getElementById('personCount').textContent = data.person_count;
+                        document.getElementById('detectionOverlay').textContent = `👤 ${data.person_count} | 🚗 ${data.vehicle_count || 0}`;
                     }
-                }, 1500);
-            }
-        }
-        
-        // ============================================
-        // ALERTS
-        // ============================================
-        function addAlert(title, message, isEmergency = false) {
-            const container = document.getElementById('alertList');
-            const time = new Date().toLocaleTimeString();
-            const div = document.createElement('div');
-            div.className = `alert-item ${isEmergency ? 'emergency' : ''}`;
-            div.innerHTML = `
-                <span class="time">${time}</span>
-                <strong>${title}</strong>: ${message}
-            `;
-            container.insertBefore(div, container.firstChild);
-            
-            // Remove old alerts
-            while (container.children.length > 20) {
-                container.removeChild(container.lastChild);
-            }
-            
-            // Hide placeholder
-            const placeholder = container.querySelector('div[style*="text-align"]');
-            if (placeholder) placeholder.style.display = 'none';
+                    if (data.vehicle_count !== undefined) {
+                        document.getElementById('vehicleCount').textContent = data.vehicle_count;
+                    }
+                    if (data.fps !== undefined && data.fps > 0) {
+                        document.getElementById('fpsValue').textContent = data.fps;
+                    }
+                })
+                .catch(() => {
+                    document.getElementById('serverStatus').textContent = '🌐 Connecting...';
+                    document.getElementById('serverStatus').className = 'badge badge-warning';
+                });
         }
         
         // ============================================
         // INITIALIZATION
         // ============================================
         function init() {
-            connectWebSocket();
             startGPS();
             
             // Auto-start camera
             setTimeout(startCamera, 1000);
             
-            // Periodic stats refresh
-            setInterval(() => {
-                fetch('/stats')
-                    .then(res => res.json())
-                    .then(data => {
-                        if (data.person_count !== undefined) {
-                            document.getElementById('personCount').textContent = data.person_count;
-                            document.getElementById('vehicleCount').textContent = data.vehicle_count || 0;
-                            document.getElementById('fpsValue').textContent = data.fps || 0;
-                            document.getElementById('detectionOverlay').textContent = 
-                                `👤 ${data.person_count} | 🚗 ${data.vehicle_count || 0}`;
-                        }
-                    })
-                    .catch(() => {});
-            }, 2000);
+            // Poll server every 2 seconds
+            setInterval(pollServer, 2000);
             
-            addAlert('System', 'Smart Blind Stick ready!');
             console.log('✅ System initialized');
         }
         
@@ -1182,7 +830,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             if (stream) {
                 stream.getTracks().forEach(track => track.stop());
             }
-            if (ws) ws.close();
         });
     </script>
 </body>
@@ -1190,7 +837,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 '''
 
 # ============================================
-# FLASK ROUTES
+# FLASK ROUTES - Fixed for Render
 # ============================================
 
 blind_stick = None
@@ -1202,32 +849,60 @@ def index():
 @app.route('/stats')
 def stats():
     if blind_stick:
-        return jsonify({
-            'connected_clients': len(blind_stick.clients),
-            'person_count': blind_stick.person_count,
-            'vehicle_count': blind_stick.vehicle_count,
-            'fps': blind_stick.fps,
-            'emergency': blind_stick.emergency_mode,
-            'location': blind_stick.current_location,
-            'detection_count': blind_stick.detection_count
-        })
-    return jsonify({'connected_clients': 0, 'person_count': 0, 'fps': 0})
+        data = blind_stick.get_current_data()
+        return jsonify(data)
+    return jsonify({'person_count': 0, 'vehicle_count': 0, 'fps': 0})
+
+@app.route('/process_frame', methods=['POST'])
+def process_frame():
+    """Process frame from mobile camera"""
+    if not blind_stick:
+        return jsonify({'error': 'System not ready'}), 503
+    
+    try:
+        data = request.json
+        image_data = data.get('image', '')
+        
+        if image_data and ',' in image_data:
+            # Remove data URL prefix
+            image_data = image_data.split(',')[1]
+            
+            # Add to queue for processing
+            if blind_stick.frame_queue.qsize() < 5:
+                blind_stick.frame_queue.put(image_data)
+        
+        # Return current detection results
+        return jsonify(blind_stick.get_current_data())
+        
+    except Exception as e:
+        print(f"Frame processing error: {e}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/emergency', methods=['POST'])
 def emergency():
     if blind_stick:
-        try:
-            # Run async function
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            result = loop.run_until_complete(blind_stick.handle_emergency_request())
-            loop.close()
-            
-            maps_url = f"https://www.google.com/maps?q={blind_stick.current_location['lat']},{blind_stick.current_location['lng']}"
-            return jsonify({'status': 'success', 'maps_url': maps_url})
-        except Exception as e:
-            print(f"Emergency error: {e}")
-            return jsonify({'status': 'error', 'message': str(e)}), 500
+        blind_stick.emergency_mode = True
+        
+        maps_url = f"https://www.google.com/maps?q={blind_stick.current_location['lat']},{blind_stick.current_location['lng']}"
+        
+        print(f"\n{'='*60}")
+        print("🚨 EMERGENCY ALERT!")
+        print(f"{'='*60}")
+        print(f"📍 Location: {blind_stick.current_location['address']}")
+        print(f"📍 Coordinates: {blind_stick.current_location['lat']}, {blind_stick.current_location['lng']}")
+        print(f"👥 Persons detected: {blind_stick.person_count}")
+        print(f"{'='*60}\n")
+        
+        # Reset emergency after 30 seconds
+        def reset_emergency():
+            time.sleep(30)
+            blind_stick.emergency_mode = False
+            print("🔴 Emergency mode reset")
+        
+        threading.Thread(target=reset_emergency, daemon=True).start()
+        
+        return jsonify({'status': 'success', 'maps_url': maps_url})
+    
     return jsonify({'status': 'error'}), 500
 
 @app.route('/location', methods=['POST'])
@@ -1237,13 +912,12 @@ def update_location():
             data = request.json
             lat = data.get('lat')
             lng = data.get('lng')
-            address = data.get('address')
             
             if lat is not None and lng is not None:
                 blind_stick.current_location = {
                     "lat": lat,
                     "lng": lng,
-                    "address": address or f"{lat:.6f}, {lng:.6f}",
+                    "address": f"{lat:.6f}, {lng:.6f}",
                     "source": "mobile_gps"
                 }
                 return jsonify({'status': 'success'})
@@ -1256,7 +930,7 @@ def test():
     return jsonify({
         'status': 'running',
         'render': IS_RENDER,
-        'clients': len(blind_stick.clients) if blind_stick else 0,
+        'model_loaded': blind_stick.model is not None if blind_stick else False,
         'timestamp': datetime.now().isoformat()
     })
 
@@ -1268,38 +942,27 @@ if __name__ == "__main__":
     # Initialize system
     blind_stick = SmartBlindStick()
     
-    # Start system in background
-    system_thread = threading.Thread(target=blind_stick.run, daemon=True)
-    system_thread.start()
-    
-    # Wait for system to start
-    time.sleep(2)
-    
     print("\n" + "="*60)
     print("🚀 STARTING FLASK SERVER...")
     print("="*60)
     
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
-    
     if IS_RENDER:
-        print("📱 Open on mobile: https://your-app.onrender.com")
         print("☁️ Render Cloud Deployment")
+        print(f"📱 Open on mobile: https://your-app.onrender.com")
     else:
-        print(f"📱 Open on MOBILE: http://{local_ip}:5000")
-        print(f"💻 Open on COMPUTER: http://127.0.0.1:5000")
+        print(f"📱 Open on mobile: http://{socket.gethostbyname(socket.gethostname())}:{PORT}")
+        print(f"💻 Open on computer: http://127.0.0.1:{PORT}")
     
     print("\n💡 FEATURES:")
     print("   📱 Mobile camera as video source")
     print("   🎯 YOLO object detection")
     print("   📍 GPS tracking")
     print("   🚨 Emergency alerts")
-    print("   👥 Multi-user support")
     print("="*60 + "\n")
     
     try:
-        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+        app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
         if blind_stick:
-            blind_stick.cleanup()
+            blind_stick.processing = False
