@@ -1,4 +1,4 @@
-# app.py - Fixed for Render Deployment
+# app.py - Complete Working Code for Render with Dashboard Links
 import cv2
 import numpy as np
 import threading
@@ -6,23 +6,28 @@ import time
 import queue
 import warnings
 import json
-import requests
 import os
 import base64
+import urllib.request
+import socket
 from datetime import datetime
-from flask import Flask, Response, render_template_string, jsonify, request, send_from_directory
+from flask import Flask, render_template_string, jsonify, request
 from flask_cors import CORS
 from ultralytics import YOLO
-import math
+import hashlib
 
 warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)
 CORS(app)
 
-# Check if running on Render/Cloud
+# Check if running on Render
 IS_RENDER = os.environ.get('RENDER', False)
 PORT = int(os.environ.get('PORT', 5000))
+
+# Store shared device views
+device_views = {}
 
 class SmartBlindStick:
     def __init__(self):
@@ -30,23 +35,34 @@ class SmartBlindStick:
         print("🦯 Initializing Smart Blind Stick System")
         print("="*60)
         
-        # Download and load YOLO model
+        # Generate unique device ID
+        self.device_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
+        
+        # Load YOLO model
         print("\n📷 Loading YOLO model...")
+        self.model = None
+        self.model_loaded = False
+        
         try:
-            # Download model if not exists
             model_path = 'yolov8n.pt'
             if not os.path.exists(model_path):
-                print("   Downloading YOLO model (first time only)...")
-                import urllib.request
+                print("   ⬇️ Downloading YOLO model (first time only)...")
                 url = 'https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt'
                 urllib.request.urlretrieve(url, model_path)
                 print("   ✅ Model downloaded!")
             
             self.model = YOLO(model_path)
-            print("✅ YOLO model loaded!")
+            
+            # Test with dummy image
+            test_img = np.zeros((640, 640, 3), dtype=np.uint8)
+            self.model(test_img, verbose=False)
+            self.model_loaded = True
+            print("✅ YOLO model loaded and tested successfully!")
+            
         except Exception as e:
-            print(f"⚠️ YOLO not available: {e}")
+            print(f"❌ YOLO loading error: {e}")
             self.model = None
+            self.model_loaded = False
         
         self.important_classes = {
             0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 
@@ -61,43 +77,56 @@ class SmartBlindStick:
         self.emergency_mode = False
         self.last_frame_time = time.time()
         self.frame_count = 0
+        self.total_frames_processed = 0
+        self.total_detections_found = 0
         
-        # Current location (demo/fallback)
+        # Current location
         self.current_location = {
             "lat": 11.2745,
             "lng": 77.5831,
-            "address": "Perundurai, Tamil Nadu, India",
-            "source": "demo"
+            "address": "Perundurai, Tamil Nadu, India"
         }
         
-        # Frame queue for processing
-        self.frame_queue = queue.Queue(maxsize=5)
-        self.result_queue = queue.Queue(maxsize=5)
+        # Frame queue
+        self.frame_queue = queue.Queue(maxsize=10)
         self.processing = False
         self.last_detection = []
-        self.last_update_time = time.time()
         
         # Start processing thread
         threading.Thread(target=self.process_frames, daemon=True).start()
         
+        # Get network info
+        self.local_ip = self.get_local_ip()
+        
         print("\n" + "="*60)
         print("✅ SYSTEM READY!")
-        print(f"   YOLO: {'✅ Loaded' if self.model else '⚠️ Not Available'}")
+        print(f"   Device ID: {self.device_id}")
+        print(f"   YOLO: {'✅ Loaded' if self.model_loaded else '❌ Not Available'}")
         print(f"   Mode: {'☁️ Cloud Mode' if IS_RENDER else '💻 Local Mode'}")
         print("="*60 + "\n")
+    
+    def get_local_ip(self):
+        """Get local IP address"""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            ip = s.getsockname()[0]
+            s.close()
+            return ip
+        except:
+            return "127.0.0.1"
     
     def process_frames(self):
         """Process frames in background"""
         self.processing = True
+        print("🔍 Frame processing thread started")
         
         while self.processing:
             try:
-                # Get frame from queue
-                frame_data = self.frame_queue.get(timeout=0.5)
+                frame_data = self.frame_queue.get(timeout=1.0)
                 if frame_data is None:
                     continue
                 
-                # Decode image
                 try:
                     image_bytes = base64.b64decode(frame_data)
                     np_arr = np.frombuffer(image_bytes, np.uint8)
@@ -106,7 +135,17 @@ class SmartBlindStick:
                     if frame is None:
                         continue
                     
-                    # Process with YOLO
+                    self.total_frames_processed += 1
+                    
+                    # Resize for performance
+                    height, width = frame.shape[:2]
+                    if width > 480:
+                        scale = 480 / width
+                        new_width = 480
+                        new_height = int(height * scale)
+                        frame = cv2.resize(frame, (new_width, new_height))
+                    
+                    # Detect objects
                     detections = self.detect_with_yolo(frame)
                     
                     # Update stats
@@ -114,69 +153,75 @@ class SmartBlindStick:
                     self.vehicle_count = sum(1 for d in detections if d['class'] in ['car', 'truck', 'bus', 'bicycle', 'motorcycle'])
                     self.detected_objects = detections
                     
+                    if len(detections) > 0:
+                        self.total_detections_found += len(detections)
+                        print(f"✅ Detected {len(detections)} objects")
+                    
                     # Calculate FPS
                     self.frame_count += 1
                     current_time = time.time()
-                    if current_time - self.last_frame_time > 1.0:
+                    if current_time - self.last_frame_time >= 1.0:
                         self.fps = self.frame_count
                         self.frame_count = 0
                         self.last_frame_time = current_time
                     
-                    # Store result
                     self.last_detection = detections
-                    self.last_update_time = time.time()
+                    
+                    # Store in shared view
+                    self.store_shared_view()
                     
                 except Exception as e:
-                    print(f"Frame processing error: {e}")
+                    print(f"⚠️ Frame processing error: {e}")
                     continue
                     
             except queue.Empty:
                 continue
             except Exception as e:
-                print(f"Unexpected error in process_frames: {e}")
+                print(f"⚠️ Unexpected error: {e}")
                 continue
     
     def detect_with_yolo(self, frame):
-        """Run YOLO detection on frame"""
+        """Run YOLO detection"""
         detections = []
         height, width = frame.shape[:2]
         
-        if self.model is None:
+        if self.model is None or not self.model_loaded:
             return detections
         
         try:
-            results = self.model(frame, stream=True, conf=0.3, verbose=False)
+            results = self.model(frame, stream=True, conf=0.2, iou=0.45, verbose=False)
             
             for r in results:
                 boxes = r.boxes
-                if boxes is not None:
+                if boxes is not None and len(boxes) > 0:
                     for box in boxes:
                         cls = int(box.cls[0])
                         conf = float(box.conf[0])
                         
-                        if conf < 0.3:
+                        if cls not in self.important_classes or conf < 0.2:
                             continue
                         
-                        class_name = self.important_classes.get(cls, f"object_{cls}")
+                        class_name = self.important_classes[cls]
                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                         
-                        # Calculate distance based on box size
+                        # Calculate distance
                         box_height = y2 - y1
+                        box_width = x2 - x1
+                        area_ratio = (box_height * box_width) / (height * width)
                         
-                        if box_height > height * 0.5:
+                        if area_ratio > 0.3:
                             distance = "very close"
                             distance_cm = 30
-                        elif box_height > height * 0.3:
+                        elif area_ratio > 0.15:
                             distance = "close"
                             distance_cm = 60
-                        elif box_height > height * 0.15:
+                        elif area_ratio > 0.05:
                             distance = "medium"
                             distance_cm = 120
                         else:
                             distance = "far"
                             distance_cm = 200
                         
-                        # Determine direction
                         center_x = (x1 + x2) / 2
                         if center_x < width * 0.3:
                             direction = "left"
@@ -185,23 +230,51 @@ class SmartBlindStick:
                         else:
                             direction = "center"
                         
-                        detection = {
+                        detections.append({
                             'class': class_name,
-                            'confidence': conf,
+                            'confidence': round(conf, 3),
                             'distance': distance,
                             'distance_cm': distance_cm,
                             'direction': direction
-                        }
-                        detections.append(detection)
+                        })
             
         except Exception as e:
-            print(f"Detection error: {e}")
+            print(f"❌ Detection error: {e}")
         
         return detections
+    
+    def store_shared_view(self):
+        """Store current detection results for sharing"""
+        global device_views
+        
+        data = {
+            'device_id': self.device_id,
+            'timestamp': datetime.now().isoformat(),
+            'person_count': self.person_count,
+            'vehicle_count': self.vehicle_count,
+            'fps': self.fps,
+            'detections': self.last_detection[:15],
+            'location': self.current_location,
+            'emergency': self.emergency_mode,
+            'active': True,
+            'last_update': time.time(),
+            'model_loaded': self.model_loaded,
+            'total_frames': self.total_frames_processed,
+            'total_detections': self.total_detections_found
+        }
+        
+        device_views[self.device_id] = data
+        
+        # Clean old entries
+        current_time = time.time()
+        for device_id in list(device_views.keys()):
+            if current_time - device_views[device_id].get('last_update', 0) > 15:
+                device_views[device_id]['active'] = False
     
     def get_current_data(self):
         """Get current detection data"""
         return {
+            'device_id': self.device_id,
             'detections': self.last_detection[:15],
             'person_count': self.person_count,
             'vehicle_count': self.vehicle_count,
@@ -209,11 +282,17 @@ class SmartBlindStick:
             'emergency': self.emergency_mode,
             'location': self.current_location,
             'timestamp': datetime.now().isoformat(),
-            'total_detections': len(self.last_detection)
+            'total_detections': len(self.last_detection),
+            'debug': {
+                'model_loaded': self.model_loaded,
+                'frames_processed': self.total_frames_processed,
+                'total_detections_found': self.total_detections_found,
+                'queue_size': self.frame_queue.qsize()
+            }
         }
 
 # ============================================
-# HTML TEMPLATE - Fixed for Render
+# HTML TEMPLATE - With Dashboard Links
 # ============================================
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
@@ -237,20 +316,29 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             text-align: center;
             padding: 10px 0 15px 0;
         }
-        .header h1 { font-size: 22px; background: linear-gradient(135deg, #4caf50, #2196f3); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
-        .header .subtitle { font-size: 12px; opacity: 0.6; color: #888; }
+        .header h1 { 
+            font-size: 22px; 
+            background: linear-gradient(135deg, #4caf50, #2196f3); 
+            -webkit-background-clip: text; 
+            -webkit-text-fill-color: transparent; 
+        }
+        .header .subtitle { 
+            font-size: 12px; 
+            opacity: 0.6; 
+            color: #888;
+        }
         
         .status-bar {
             display: flex;
             justify-content: center;
-            gap: 8px;
+            gap: 6px;
             flex-wrap: wrap;
             margin-bottom: 12px;
         }
         .badge {
-            padding: 4px 12px;
+            padding: 3px 10px;
             border-radius: 20px;
-            font-size: 11px;
+            font-size: 10px;
             font-weight: 600;
         }
         .badge-success { background: rgba(76,175,80,0.2); border: 1px solid #4caf50; color: #4caf50; }
@@ -380,6 +468,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .location-card .label { font-size: 11px; opacity: 0.6; }
         .location-card .address { font-size: 14px; font-weight: 500; margin: 4px 0; }
         .location-card .coords { font-size: 12px; opacity: 0.7; }
+        .location-card button {
+            margin-top: 8px;
+            padding: 8px 16px;
+            border: none;
+            border-radius: 8px;
+            background: #4caf50;
+            color: #fff;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            width: 100%;
+        }
         
         .controls {
             display: flex;
@@ -402,6 +502,83 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .controls .btn-camera { background: rgba(33,150,243,0.3); color: #2196f3; }
         .controls .btn-camera.active { background: rgba(76,175,80,0.3); color: #4caf50; }
         
+        /* Dashboard Links Section */
+        .dashboard-links {
+            background: rgba(255,255,255,0.05);
+            border-radius: 16px;
+            padding: 16px;
+            margin: 12px 0;
+            border: 1px solid rgba(255,255,255,0.1);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+        .dashboard-links .title {
+            font-size: 14px;
+            font-weight: 600;
+            margin-bottom: 12px;
+            color: #4caf50;
+        }
+        .dashboard-links .link-item {
+            background: rgba(0,0,0,0.3);
+            border-radius: 10px;
+            padding: 12px;
+            margin-bottom: 10px;
+        }
+        .dashboard-links .link-item:last-child { margin-bottom: 0; }
+        .dashboard-links .link-label {
+            font-size: 11px;
+            opacity: 0.6;
+            margin-bottom: 4px;
+        }
+        .dashboard-links .link-url {
+            font-size: 13px;
+            font-family: monospace;
+            word-break: break-all;
+            color: #4caf50;
+            background: rgba(0,0,0,0.2);
+            padding: 6px 10px;
+            border-radius: 6px;
+            display: block;
+        }
+        .dashboard-links .copy-btn {
+            background: rgba(76,175,80,0.2);
+            border: 1px solid #4caf50;
+            color: #4caf50;
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 11px;
+            cursor: pointer;
+            margin-top: 4px;
+        }
+        .dashboard-links .copy-btn:active { transform: scale(0.95); }
+        .dashboard-links .device-info {
+            font-size: 11px;
+            opacity: 0.5;
+            margin-top: 8px;
+            text-align: center;
+        }
+        .qr-container {
+            text-align: center;
+            margin-top: 10px;
+            padding: 10px;
+            background: white;
+            border-radius: 10px;
+            display: none;
+        }
+        #qrcode img {
+            margin: 0 auto;
+        }
+        
+        .debug-info {
+            font-size: 10px;
+            opacity: 0.4;
+            text-align: center;
+            padding: 8px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 8px;
+            font-family: monospace;
+            margin-top: 8px;
+        }
+        
         .hidden { display: none; }
         
         ::-webkit-scrollbar { width: 3px; }
@@ -411,20 +588,37 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 </head>
 <body>
     <div class="container">
-        <!-- Header -->
         <div class="header">
             <h1>🦯 Smart Blind Stick</h1>
             <div class="subtitle">Real-time Object Detection & GPS Tracking</div>
         </div>
         
-        <!-- Status -->
         <div class="status-bar">
             <span id="cameraStatus" class="badge badge-warning">📷 Starting...</span>
             <span id="gpsStatus" class="badge badge-warning">📍 GPS...</span>
             <span id="serverStatus" class="badge badge-warning">🌐 Connecting...</span>
+            <span id="modelStatus" class="badge badge-warning">🤖 Loading...</span>
         </div>
         
-        <!-- Video Container -->
+        <!-- Dashboard Links -->
+        <div class="dashboard-links">
+            <div class="title">🔗 Connection Links</div>
+            
+            <div class="link-item">
+                <div class="link-label">📱 Mobile / 💻 Laptop</div>
+                <span class="link-url" id="mainUrl">Loading...</span>
+                <button class="copy-btn" onclick="copyUrl('mainUrl')">📋 Copy</button>
+            </div>
+            
+            <div class="link-item" id="localLinkItem" style="display:none;">
+                <div class="link-label">🏠 Local Network (Same WiFi)</div>
+                <span class="link-url" id="localUrl">Loading...</span>
+                <button class="copy-btn" onclick="copyUrl('localUrl')">📋 Copy</button>
+            </div>
+            
+            <div class="device-info" id="deviceInfo">Device ID: Loading...</div>
+        </div>
+        
         <div class="video-container">
             <video id="video" autoplay playsinline muted></video>
             <div class="video-overlay">
@@ -433,21 +627,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             </div>
             <div id="videoPlaceholder" class="video-placeholder">
                 <div class="icon">📷</div>
-                <div>Starting camera...</div>
-                <div style="font-size:11px;margin-top:8px;opacity:0.5;">Tap "Start Camera" below</div>
+                <div>Tap "Start Camera" below</div>
+                <div style="font-size:11px;margin-top:8px;opacity:0.5;">Camera access required</div>
             </div>
         </div>
         
-        <!-- Controls -->
         <div class="controls">
             <button class="btn-camera" id="cameraBtn" onclick="toggleCamera()">📷 Start Camera</button>
             <button onclick="switchCamera()">🔄 Switch</button>
         </div>
         
-        <!-- Emergency Button -->
         <button class="emergency-btn" onclick="sendEmergency()">🚨 EMERGENCY</button>
         
-        <!-- Stats -->
         <div class="stats-grid">
             <div class="stat-card">
                 <div class="stat-value" id="personCount">0</div>
@@ -463,20 +654,18 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             </div>
         </div>
         
-        <!-- Detections -->
         <div class="detection-list" id="detectionList">
-            <div style="text-align:center; opacity:0.5; padding:10px; font-size:13px;">No objects detected</div>
+            <div style="text-align:center; opacity:0.5; padding:10px; font-size:13px;">🔍 Looking for objects...</div>
         </div>
         
-        <!-- Location -->
         <div class="location-card">
             <div class="label">📍 Current Location</div>
             <div class="address" id="addressText">Getting location...</div>
             <div class="coords" id="coordsText">11.2745°N, 77.5831°E</div>
-            <div style="margin-top:8px;display:flex;gap:8px;">
-                <button onclick="openGoogleMaps()" style="flex:1;padding:8px;border:none;border-radius:8px;background:#4caf50;color:#fff;font-size:12px;font-weight:600;cursor:pointer;">🗺️ Open Maps</button>
-            </div>
+            <button onclick="openGoogleMaps()">🗺️ Open Google Maps</button>
         </div>
+        
+        <div class="debug-info" id="debugInfo">Model: Loading... | Frames: 0 | Detections: 0</div>
     </div>
     
     <script>
@@ -490,18 +679,68 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         let captureInterval = null;
         let lastFrameTime = Date.now();
         let frameCount = 0;
-        let serverUrl = window.location.origin;
+        let retryCount = 0;
+        const MAX_RETRIES = 3;
         
         // ============================================
-        // CAMERA
+        // COPY URL
+        // ============================================
+        function copyUrl(elementId) {
+            const element = document.getElementById(elementId);
+            const text = element.textContent;
+            navigator.clipboard.writeText(text).then(() => {
+                const btn = element.parentElement.querySelector('.copy-btn');
+                const originalText = btn.textContent;
+                btn.textContent = '✅ Copied!';
+                setTimeout(() => { btn.textContent = originalText; }, 2000);
+            }).catch(() => {
+                // Fallback
+                const textArea = document.createElement('textarea');
+                textArea.value = text;
+                document.body.appendChild(textArea);
+                textArea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textArea);
+                alert('URL copied to clipboard!');
+            });
+        }
+        
+        // ============================================
+        // UPDATE LINKS
+        // ============================================
+        function updateLinks() {
+            const currentUrl = window.location.href;
+            document.getElementById('mainUrl').textContent = currentUrl;
+            
+            // Get device info
+            fetch('/test')
+                .then(res => res.json())
+                .then(data => {
+                    document.getElementById('deviceInfo').textContent = 
+                        `Device ID: ${data.device_id || 'Unknown'} | Model: ${data.model_loaded ? '✅' : '❌'}`;
+                    
+                    if (data.local_ip && !data.is_render) {
+                        document.getElementById('localLinkItem').style.display = 'block';
+                        document.getElementById('localUrl').textContent = `http://${data.local_ip}:${data.port}`;
+                    }
+                })
+                .catch(() => {});
+        }
+        
+        // ============================================
+        // CAMERA - With Retry Logic
         // ============================================
         async function startCamera() {
             try {
+                if (window.location.protocol !== 'https:' && !window.location.hostname.includes('localhost')) {
+                    console.warn('⚠️ Not running on HTTPS. Camera may not work.');
+                }
+                
                 const constraints = {
                     video: {
                         facingMode: facingMode,
-                        width: { ideal: 640 },
-                        height: { ideal: 480 }
+                        width: { ideal: 480 },
+                        height: { ideal: 360 }
                     },
                     audio: false
                 };
@@ -511,22 +750,28 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 await video.play();
                 
                 isCameraOn = true;
+                retryCount = 0;
                 document.getElementById('videoPlaceholder').classList.add('hidden');
                 document.getElementById('cameraBtn').textContent = '⏹️ Stop Camera';
                 document.getElementById('cameraBtn').classList.add('active');
                 document.getElementById('cameraStatus').textContent = '📷 Active';
                 document.getElementById('cameraStatus').className = 'badge badge-success';
                 
-                // Start sending frames
                 startFrameCapture();
-                
                 console.log('📷 Camera started');
                 
             } catch(err) {
                 console.error('Camera error:', err);
-                document.getElementById('cameraStatus').textContent = '❌ Camera Error';
+                document.getElementById('cameraStatus').textContent = '❌ Error';
                 document.getElementById('cameraStatus').className = 'badge badge-danger';
-                alert('Camera access denied. Please allow camera permissions.');
+                
+                if (retryCount < MAX_RETRIES) {
+                    retryCount++;
+                    console.log(`Retrying camera (${retryCount}/${MAX_RETRIES})...`);
+                    setTimeout(startCamera, 2000);
+                } else {
+                    alert('Camera access denied. Please:\n1. Use HTTPS (Render URL)\n2. Allow camera permissions\n3. Try Chrome browser');
+                }
             }
         }
         
@@ -548,8 +793,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             document.getElementById('cameraBtn').classList.remove('active');
             document.getElementById('cameraStatus').textContent = '📷 Stopped';
             document.getElementById('cameraStatus').className = 'badge badge-warning';
-            
-            console.log('📷 Camera stopped');
         }
         
         function toggleCamera() {
@@ -572,13 +815,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         // FRAME CAPTURE
         // ============================================
         function startFrameCapture() {
-            if (captureInterval) {
-                clearInterval(captureInterval);
-            }
+            if (captureInterval) clearInterval(captureInterval);
             
             const canvas = document.createElement('canvas');
-            canvas.width = 640;
-            canvas.height = 480;
+            canvas.width = 480;
+            canvas.height = 360;
             const ctx = canvas.getContext('2d');
             
             captureInterval = setInterval(() => {
@@ -588,25 +829,34 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 
                 try {
                     ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                    const imageData = canvas.toDataURL('image/jpeg', 0.8);
                     
-                    // Compress to JPEG
-                    const imageData = canvas.toDataURL('image/jpeg', 0.6);
-                    
-                    // Send to server via HTTP POST (more reliable than WebSocket on Render)
                     fetch('/process_frame', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ image: imageData })
-                    }).then(res => res.json())
-                      .then(data => updateUI(data))
-                      .catch(err => console.error('Frame send error:', err));
+                    })
+                    .then(res => res.json())
+                    .then(data => {
+                        updateUI(data);
+                        if (data.debug) {
+                            document.getElementById('debugInfo').textContent = 
+                                `Model: ${data.debug.model_loaded ? '✅ Loaded' : '❌ Not Loaded'} | ` +
+                                `Frames: ${data.debug.frames_processed} | ` +
+                                `Detections: ${data.debug.total_detections_found}`;
+                            
+                            document.getElementById('modelStatus').textContent = 
+                                data.debug.model_loaded ? '🤖 Active' : '❌ Error';
+                            document.getElementById('modelStatus').className = 
+                                data.debug.model_loaded ? 'badge badge-success' : 'badge badge-danger';
+                        }
+                    })
+                    .catch(err => console.error('Send error:', err));
                     
-                    // Update FPS
                     frameCount++;
                     const now = Date.now();
                     if (now - lastFrameTime >= 1000) {
-                        const fps = frameCount;
-                        document.getElementById('fpsOverlay').textContent = fps;
+                        document.getElementById('fpsOverlay').textContent = frameCount;
                         frameCount = 0;
                         lastFrameTime = now;
                     }
@@ -614,61 +864,59 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 } catch(e) {
                     console.error('Frame capture error:', e);
                 }
-            }, 150); // ~7 FPS for better performance
+            }, 200);
             
             console.log('📷 Frame capture started');
         }
         
         // ============================================
-        // GPS TRACKING
+        // GPS
         // ============================================
         let watchId = null;
         let currentLocation = { lat: 11.2745, lng: 77.5831 };
         
         function startGPS() {
             if (!navigator.geolocation) {
-                document.getElementById('gpsStatus').textContent = '❌ GPS Not Supported';
+                document.getElementById('gpsStatus').textContent = '❌ Not Supported';
                 document.getElementById('gpsStatus').className = 'badge badge-danger';
                 return;
+            }
+            
+            if (window.location.protocol !== 'https:' && !window.location.hostname.includes('localhost')) {
+                document.getElementById('gpsStatus').textContent = '⚠️ HTTPS Required';
+                document.getElementById('gpsStatus').className = 'badge badge-danger';
             }
             
             watchId = navigator.geolocation.watchPosition(
                 (position) => {
                     const lat = position.coords.latitude;
                     const lng = position.coords.longitude;
-                    const accuracy = position.coords.accuracy;
-                    
                     currentLocation = { lat, lng };
                     
                     document.getElementById('coordsText').textContent = 
                         `${lat.toFixed(6)}°N, ${lng.toFixed(6)}°E`;
-                    document.getElementById('gpsStatus').textContent = '📍 GPS Active';
+                    document.getElementById('gpsStatus').textContent = '📍 Active';
                     document.getElementById('gpsStatus').className = 'badge badge-success';
                     
-                    // Send to server
                     fetch('/location', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ lat, lng })
                     }).catch(() => {});
                     
-                    // Reverse geocode
                     reverseGeocode(lat, lng);
-                    
-                    console.log(`📍 GPS: ${lat.toFixed(6)}, ${lng.toFixed(6)}`);
                 },
                 (error) => {
                     console.error('GPS Error:', error);
-                    document.getElementById('gpsStatus').textContent = '⚠️ GPS Error';
+                    document.getElementById('gpsStatus').textContent = '⚠️ Error';
                     document.getElementById('gpsStatus').className = 'badge badge-danger';
                 },
-                { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+                { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
             );
         }
         
         function reverseGeocode(lat, lng) {
             const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`;
-            
             fetch(url)
                 .then(res => res.json())
                 .then(data => {
@@ -677,15 +925,12 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     }
                 })
                 .catch(() => {
-                    document.getElementById('addressText').textContent = 
-                        `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+                    document.getElementById('addressText').textContent = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
                 });
         }
         
         function openGoogleMaps() {
-            const lat = currentLocation.lat;
-            const lng = currentLocation.lng;
-            const url = `https://www.google.com/maps?q=${lat},${lng}`;
+            const url = `https://www.google.com/maps?q=${currentLocation.lat},${currentLocation.lng}`;
             window.open(url, '_blank');
         }
         
@@ -695,11 +940,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         function updateUI(data) {
             if (!data) return;
             
-            // Update server status
             document.getElementById('serverStatus').textContent = '🌐 Connected';
             document.getElementById('serverStatus').className = 'badge badge-success';
             
-            // Stats
             if (data.person_count !== undefined) {
                 document.getElementById('personCount').textContent = data.person_count;
                 document.getElementById('detectionOverlay').textContent = `👤 ${data.person_count} | 🚗 ${data.vehicle_count || 0}`;
@@ -711,7 +954,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 document.getElementById('fpsValue').textContent = data.fps;
             }
             
-            // Detections
             if (data.detections && data.detections.length > 0) {
                 let html = '';
                 data.detections.forEach(d => {
@@ -730,10 +972,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 document.getElementById('detectionList').innerHTML = html;
             } else {
                 document.getElementById('detectionList').innerHTML = 
-                    '<div style="text-align:center; opacity:0.5; padding:10px; font-size:13px;">No objects detected</div>';
+                    '<div style="text-align:center; opacity:0.5; padding:10px; font-size:13px;">🔍 Looking for objects...</div>';
             }
             
-            // Location
             if (data.location) {
                 document.getElementById('coordsText').textContent = 
                     `${data.location.lat.toFixed(6)}°N, ${data.location.lng.toFixed(6)}°E`;
@@ -759,14 +1000,11 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 if (data.status === 'success') {
                     alert('🚨 Emergency alert sent successfully!');
                     if (navigator.vibrate) navigator.vibrate([500, 300, 500]);
-                    
                     setTimeout(() => {
                         if (confirm('🚨 Open Google Maps for location?')) {
                             openGoogleMaps();
                         }
                     }, 1000);
-                } else {
-                    alert('Failed to send emergency alert');
                 }
             } catch(e) {
                 console.error('Emergency error:', e);
@@ -778,7 +1016,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         }
         
         // ============================================
-        // POLL SERVER FOR UPDATES
+        // POLL SERVER
         // ============================================
         function pollServer() {
             fetch('/stats')
@@ -787,7 +1025,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     document.getElementById('serverStatus').textContent = '🌐 Connected';
                     document.getElementById('serverStatus').className = 'badge badge-success';
                     
-                    // Update stats
                     if (data.person_count !== undefined) {
                         document.getElementById('personCount').textContent = data.person_count;
                         document.getElementById('detectionOverlay').textContent = `👤 ${data.person_count} | 🚗 ${data.vehicle_count || 0}`;
@@ -797,6 +1034,13 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     }
                     if (data.fps !== undefined && data.fps > 0) {
                         document.getElementById('fpsValue').textContent = data.fps;
+                    }
+                    
+                    if (data.debug) {
+                        document.getElementById('debugInfo').textContent = 
+                            `Model: ${data.debug.model_loaded ? '✅ Loaded' : '❌ Not Loaded'} | ` +
+                            `Frames: ${data.debug.frames_processed} | ` +
+                            `Detections: ${data.debug.total_detections_found}`;
                     }
                 })
                 .catch(() => {
@@ -810,6 +1054,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         // ============================================
         function init() {
             startGPS();
+            updateLinks();
             
             // Auto-start camera
             setTimeout(startCamera, 1000);
@@ -817,13 +1062,16 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             // Poll server every 2 seconds
             setInterval(pollServer, 2000);
             
+            // Update links periodically
+            setInterval(updateLinks, 10000);
+            
             console.log('✅ System initialized');
+            console.log('📱 Open on mobile:', window.location.href);
+            console.log('💻 Open on laptop:', window.location.href);
         }
         
-        // Start when page loads
         document.addEventListener('DOMContentLoaded', init);
         
-        // Cleanup on page unload
         window.addEventListener('beforeunload', () => {
             if (captureInterval) clearInterval(captureInterval);
             if (watchId) navigator.geolocation.clearWatch(watchId);
@@ -837,7 +1085,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 '''
 
 # ============================================
-# FLASK ROUTES - Fixed for Render
+# FLASK ROUTES
 # ============================================
 
 blind_stick = None
@@ -849,13 +1097,25 @@ def index():
 @app.route('/stats')
 def stats():
     if blind_stick:
-        data = blind_stick.get_current_data()
-        return jsonify(data)
+        return jsonify(blind_stick.get_current_data())
     return jsonify({'person_count': 0, 'vehicle_count': 0, 'fps': 0})
+
+@app.route('/devices')
+def get_devices():
+    """Get list of all active devices"""
+    if blind_stick:
+        return jsonify({'devices': device_views})
+    return jsonify({'devices': {}})
+
+@app.route('/view/<device_id>')
+def view_device(device_id):
+    """Get shared view of a specific device"""
+    if device_id in device_views:
+        return jsonify(device_views[device_id])
+    return jsonify({'error': 'Device not found'}), 404
 
 @app.route('/process_frame', methods=['POST'])
 def process_frame():
-    """Process frame from mobile camera"""
     if not blind_stick:
         return jsonify({'error': 'System not ready'}), 503
     
@@ -864,14 +1124,10 @@ def process_frame():
         image_data = data.get('image', '')
         
         if image_data and ',' in image_data:
-            # Remove data URL prefix
             image_data = image_data.split(',')[1]
-            
-            # Add to queue for processing
-            if blind_stick.frame_queue.qsize() < 5:
+            if blind_stick.frame_queue.qsize() < 10:
                 blind_stick.frame_queue.put(image_data)
         
-        # Return current detection results
         return jsonify(blind_stick.get_current_data())
         
     except Exception as e:
@@ -883,25 +1139,20 @@ def emergency():
     if blind_stick:
         blind_stick.emergency_mode = True
         
-        maps_url = f"https://www.google.com/maps?q={blind_stick.current_location['lat']},{blind_stick.current_location['lng']}"
-        
         print(f"\n{'='*60}")
         print("🚨 EMERGENCY ALERT!")
-        print(f"{'='*60}")
         print(f"📍 Location: {blind_stick.current_location['address']}")
-        print(f"📍 Coordinates: {blind_stick.current_location['lat']}, {blind_stick.current_location['lng']}")
-        print(f"👥 Persons detected: {blind_stick.person_count}")
+        print(f"📍 Coords: {blind_stick.current_location['lat']}, {blind_stick.current_location['lng']}")
+        print(f"👥 Persons: {blind_stick.person_count}")
         print(f"{'='*60}\n")
         
-        # Reset emergency after 30 seconds
         def reset_emergency():
             time.sleep(30)
             blind_stick.emergency_mode = False
-            print("🔴 Emergency mode reset")
         
         threading.Thread(target=reset_emergency, daemon=True).start()
         
-        return jsonify({'status': 'success', 'maps_url': maps_url})
+        return jsonify({'status': 'success'})
     
     return jsonify({'status': 'error'}), 500
 
@@ -917,20 +1168,22 @@ def update_location():
                 blind_stick.current_location = {
                     "lat": lat,
                     "lng": lng,
-                    "address": f"{lat:.6f}, {lng:.6f}",
-                    "source": "mobile_gps"
+                    "address": f"{lat:.6f}, {lng:.6f}"
                 }
                 return jsonify({'status': 'success'})
         except Exception as e:
-            print(f"Location update error: {e}")
+            print(f"Location error: {e}")
     return jsonify({'status': 'error'}), 500
 
 @app.route('/test')
 def test():
     return jsonify({
         'status': 'running',
-        'render': IS_RENDER,
-        'model_loaded': blind_stick.model is not None if blind_stick else False,
+        'is_render': IS_RENDER,
+        'local_ip': blind_stick.local_ip if blind_stick else '127.0.0.1',
+        'port': PORT,
+        'model_loaded': blind_stick.model_loaded if blind_stick else False,
+        'device_id': blind_stick.device_id if blind_stick else 'Unknown',
         'timestamp': datetime.now().isoformat()
     })
 
@@ -948,16 +1201,19 @@ if __name__ == "__main__":
     
     if IS_RENDER:
         print("☁️ Render Cloud Deployment")
-        print(f"📱 Open on mobile: https://your-app.onrender.com")
+        print("📱 Open on mobile: https://your-app.onrender.com")
+        print("💻 Open on laptop: https://your-app.onrender.com")
     else:
-        print(f"📱 Open on mobile: http://{socket.gethostbyname(socket.gethostname())}:{PORT}")
-        print(f"💻 Open on computer: http://127.0.0.1:{PORT}")
+        print(f"📱 Open on mobile: http://{blind_stick.local_ip}:{PORT}")
+        print(f"💻 Open on laptop: http://{blind_stick.local_ip}:{PORT}")
+        print(f"🔄 Localhost: http://127.0.0.1:{PORT}")
     
     print("\n💡 FEATURES:")
     print("   📱 Mobile camera as video source")
     print("   🎯 YOLO object detection")
     print("   📍 GPS tracking")
     print("   🚨 Emergency alerts")
+    print("   🔗 Dashboard shows connection links")
     print("="*60 + "\n")
     
     try:
