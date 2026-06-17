@@ -1,4 +1,4 @@
-# app.py - Complete Working Code for Render with Dashboard Links
+# app.py - Complete Working Code for Render with Working Dashboard Links
 import cv2
 import numpy as np
 import threading
@@ -103,6 +103,7 @@ class SmartBlindStick:
         print(f"   Device ID: {self.device_id}")
         print(f"   YOLO: {'✅ Loaded' if self.model_loaded else '❌ Not Available'}")
         print(f"   Mode: {'☁️ Cloud Mode' if IS_RENDER else '💻 Local Mode'}")
+        print(f"   URL: https://your-app.onrender.com")
         print("="*60 + "\n")
     
     def get_local_ip(self):
@@ -292,7 +293,7 @@ class SmartBlindStick:
         }
 
 # ============================================
-# HTML TEMPLATE - With Dashboard Links
+# HTML TEMPLATE - With Working Dashboard Links
 # ============================================
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
@@ -516,6 +517,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             font-weight: 600;
             margin-bottom: 12px;
             color: #4caf50;
+            text-align: center;
         }
         .dashboard-links .link-item {
             background: rgba(0,0,0,0.3);
@@ -556,17 +558,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             margin-top: 8px;
             text-align: center;
         }
-        .qr-container {
-            text-align: center;
-            margin-top: 10px;
-            padding: 10px;
-            background: white;
-            border-radius: 10px;
-            display: none;
-        }
-        #qrcode img {
-            margin: 0 auto;
-        }
         
         .debug-info {
             font-size: 10px;
@@ -596,7 +587,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         <div class="status-bar">
             <span id="cameraStatus" class="badge badge-warning">📷 Starting...</span>
             <span id="gpsStatus" class="badge badge-warning">📍 GPS...</span>
-            <span id="serverStatus" class="badge badge-warning">🌐 Connecting...</span>
+            <span id="serverStatus" class="badge badge-success">🌐 Connected</span>
             <span id="modelStatus" class="badge badge-warning">🤖 Loading...</span>
         </div>
         
@@ -608,12 +599,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 <div class="link-label">📱 Mobile / 💻 Laptop</div>
                 <span class="link-url" id="mainUrl">Loading...</span>
                 <button class="copy-btn" onclick="copyUrl('mainUrl')">📋 Copy</button>
-            </div>
-            
-            <div class="link-item" id="localLinkItem" style="display:none;">
-                <div class="link-label">🏠 Local Network (Same WiFi)</div>
-                <span class="link-url" id="localUrl">Loading...</span>
-                <button class="copy-btn" onclick="copyUrl('localUrl')">📋 Copy</button>
             </div>
             
             <div class="device-info" id="deviceInfo">Device ID: Loading...</div>
@@ -688,27 +673,30 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         function copyUrl(elementId) {
             const element = document.getElementById(elementId);
             const text = element.textContent;
-            navigator.clipboard.writeText(text).then(() => {
-                const btn = element.parentElement.querySelector('.copy-btn');
-                const originalText = btn.textContent;
-                btn.textContent = '✅ Copied!';
-                setTimeout(() => { btn.textContent = originalText; }, 2000);
-            }).catch(() => {
-                // Fallback
-                const textArea = document.createElement('textarea');
-                textArea.value = text;
-                document.body.appendChild(textArea);
-                textArea.select();
-                document.execCommand('copy');
-                document.body.removeChild(textArea);
-                alert('URL copied to clipboard!');
-            });
+            if (text && text !== 'Loading...') {
+                navigator.clipboard.writeText(text).then(() => {
+                    const btn = element.parentElement.querySelector('.copy-btn');
+                    const originalText = btn.textContent;
+                    btn.textContent = '✅ Copied!';
+                    setTimeout(() => { btn.textContent = originalText; }, 2000);
+                }).catch(() => {
+                    // Fallback
+                    const textArea = document.createElement('textarea');
+                    textArea.value = text;
+                    document.body.appendChild(textArea);
+                    textArea.select();
+                    document.execCommand('copy');
+                    document.body.removeChild(textArea);
+                    alert('URL copied to clipboard!');
+                });
+            }
         }
         
         // ============================================
-        // UPDATE LINKS
+        // UPDATE LINKS - IMMEDIATELY
         // ============================================
         function updateLinks() {
+            // Set the URL immediately from window location
             const currentUrl = window.location.href;
             document.getElementById('mainUrl').textContent = currentUrl;
             
@@ -718,13 +706,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 .then(data => {
                     document.getElementById('deviceInfo').textContent = 
                         `Device ID: ${data.device_id || 'Unknown'} | Model: ${data.model_loaded ? '✅' : '❌'}`;
-                    
-                    if (data.local_ip && !data.is_render) {
-                        document.getElementById('localLinkItem').style.display = 'block';
-                        document.getElementById('localUrl').textContent = `http://${data.local_ip}:${data.port}`;
-                    }
                 })
-                .catch(() => {});
+                .catch(() => {
+                    document.getElementById('deviceInfo').textContent = 'Device ID: Connected';
+                });
         }
         
         // ============================================
@@ -1053,8 +1038,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         // INITIALIZATION
         // ============================================
         function init() {
-            startGPS();
+            // Update links immediately on page load
             updateLinks();
+            
+            startGPS();
             
             // Auto-start camera
             setTimeout(startCamera, 1000);
