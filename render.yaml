@@ -3,7 +3,7 @@ services:
     name: smart-blind-stick
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python blind_sticks.py
+    startCommand: python app.py
     envVars:
       - key: MONGO_URI
         value: mongodb+srv://gowsik977_db_user:gowsik123@cluster1.t4w8mul.mongodb.net/?appName=Cluster1
