@@ -8,4 +8,4 @@ pymongo==4.5.0
 pyttsx3==2.90
 websockets==11.0.1
 requests==2.31.0
-gunicorn==21.2.0  # <-- ADD THIS
+gunicorn==21.2.0
