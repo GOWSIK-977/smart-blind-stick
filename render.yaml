@@ -3,11 +3,13 @@ services:
     name: smart-blind-stick
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn --workers=1 --threads=2 --timeout=120 app:app
+    startCommand: python blind_sticks.py
     envVars:
       - key: MONGO_URI
         value: mongodb+srv://gowsik977_db_user:gowsik123@cluster1.t4w8mul.mongodb.net/?appName=Cluster1
       - key: PYTHON_VERSION
         value: 3.11.0
+      - key: RENDER
+        value: true
     plan: free
     healthCheckPath: /health
