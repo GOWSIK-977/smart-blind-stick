@@ -1,33 +1,263 @@
-# app.py - Complete Working Code for Render - FIXED
+# app.py - Complete Working Code with MongoDB Atlas & Live Location
 import cv2
 import numpy as np
 import threading
 import time
 import queue
 import warnings
+import asyncio
 import json
-import os
-import base64
-import urllib.request
+import websockets
 import socket
+import requests
+import subprocess
+import re
+import os
+import urllib.request
+import hashlib
 from datetime import datetime
-from flask import Flask, render_template_string, jsonify, request
+from flask import Flask, Response, render_template_string, jsonify, request
 from flask_cors import CORS
 from ultralytics import YOLO
-import hashlib
+import pyttsx3
+import math
+
+# MongoDB Atlas Connection
+try:
+    from pymongo import MongoClient
+    import pymongo
+    PYMONGO_AVAILABLE = True
+except ImportError:
+    PYMONGO_AVAILABLE = False
+    print("⚠️ PyMongo not installed. Install with: pip install pymongo")
+
+# Try to import serial for Arduino (optional)
+try:
+    import serial
+    import serial.tools.list_ports
+    SERIAL_AVAILABLE = True
+except ImportError:
+    SERIAL_AVAILABLE = False
+    print("⚠️ PySerial not installed. Arduino features disabled.")
 
 warnings.filterwarnings('ignore')
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24)
 CORS(app)
 
-# Check if running on Render
-IS_RENDER = os.environ.get('RENDER', False)
-PORT = int(os.environ.get('PORT', 5000))
+# ============================================
+# MONGODB ATLAS CONFIGURATION
+# ============================================
+MONGO_URI = "mongodb+srv://gowsik977_db_user:gowsik123@cluster1.t4w8mul.mongodb.net/?appName=Cluster1"
+DB_NAME = "blind_stick_db"
 
-# Store shared device views
-device_views = {}
+print("\n🔌 Connecting to MongoDB Atlas...")
+db = None
+mongo_client = None
+
+try:
+    if PYMONGO_AVAILABLE:
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        mongo_client.admin.command('ping')
+        db = mongo_client[DB_NAME]
+        
+        # Create collections if they don't exist
+        collections = ['alerts', 'detections', 'device_registry', 'emergency_events', 
+                       'live_locations', 'location_tracking', 'system_logs']
+        
+        for collection in collections:
+            if collection not in db.list_collection_names():
+                db.create_collection(collection)
+                print(f"📁 Created collection: {collection}")
+        
+        # Create indexes for better performance
+        if db is not None:
+            db.detections.create_index([("timestamp", pymongo.DESCENDING)])
+            db.detections.create_index([("device_id", pymongo.ASCENDING)])
+            db.alerts.create_index([("timestamp", pymongo.DESCENDING)])
+            db.emergency_events.create_index([("timestamp", pymongo.DESCENDING)])
+            db.location_tracking.create_index([("timestamp", pymongo.DESCENDING)])
+            db.location_tracking.create_index([("device_id", pymongo.ASCENDING)])
+            db.live_locations.create_index([("device_id", pymongo.ASCENDING)], unique=True)
+        
+        print("✅ Connected to MongoDB Atlas successfully!")
+        print(f"📊 Database: {DB_NAME}")
+        print(f"📁 Collections: {', '.join(db.list_collection_names())}")
+    else:
+        print("❌ PyMongo not available")
+        
+except Exception as e:
+    print(f"❌ MongoDB connection error: {e}")
+    db = None
+    mongo_client = None
+
+# Generate unique device ID
+DEVICE_ID = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
+DEVICE_NAME = f"Device-{DEVICE_ID[:6]}"
+
+# Your Google Maps API Key
+GOOGLE_MAPS_API_KEY = "AIzaSyCdQGVYnjmSAzxnTu4g_zEXKGhgzqbZDvc"
+
+# Arduino Manager Class
+class ArduinoManager:
+    def __init__(self, port=None, baudrate=9600):
+        self.serial_connection = None
+        self.port = port
+        self.baudrate = baudrate
+        self.connected = False
+        self.last_alert_time = 0
+        self.alert_cooldown = 0.3
+        self.last_heartbeat = 0
+        self.heartbeat_timeout = 10
+        self.reconnect_attempts = 0
+        self.max_reconnect_attempts = 3
+        self.enabled = SERIAL_AVAILABLE
+        
+    def find_arduino_port(self):
+        if not self.enabled:
+            return None
+        try:
+            print("🔍 Scanning for Arduino ports...")
+            ports = serial.tools.list_ports.comports()
+            valid_ports = []
+            for port in ports:
+                desc = port.description.lower()
+                device = port.device
+                print(f"   Found: {device} - {port.description}")
+                if any(x in desc for x in ['bluetooth', 'bt link', 'bthnum', 'hands-free', 'wireless', 'modem']):
+                    print(f"   ⚠️ Skipping Bluetooth port: {device}")
+                    continue
+                valid_ports.append(port)
+            
+            for port in valid_ports:
+                desc = port.description.lower()
+                if any(x in desc for x in ['arduino', 'usb', 'ch340', 'cp210', 'uart', 'ftdi', 'pl2303', 'prolific']):
+                    print(f"   ✅ Selected Arduino: {port.device}")
+                    return port.device
+            
+            for port in valid_ports:
+                try:
+                    test_ser = serial.Serial(port.device, 9600, timeout=0.5)
+                    test_ser.close()
+                    print(f"✅ Selected serial port: {port.device}")
+                    return port.device
+                except:
+                    continue
+            return None
+        except Exception as e:
+            print(f"Error finding Arduino: {e}")
+            return None
+    
+    def connect(self):
+        if not self.enabled:
+            print("⚠️ Serial library not available. Running without Arduino.")
+            return False
+        try:
+            if self.port is None:
+                self.port = self.find_arduino_port()
+                if self.port is None:
+                    print("⚠️ Arduino not found! Running in software-only mode.")
+                    return False
+            
+            print(f"🔌 Attempting to connect to Arduino on {self.port}...")
+            self.serial_connection = serial.Serial(self.port, self.baudrate, timeout=1)
+            time.sleep(3)
+            self.serial_connection.reset_input_buffer()
+            self.serial_connection.reset_output_buffer()
+            
+            start_time = time.time()
+            while time.time() - start_time < 5:
+                if self.serial_connection.in_waiting:
+                    response = self.serial_connection.readline().decode().strip()
+                    print(f"   Arduino: {response}")
+                    if response == "READY":
+                        self.connected = True
+                        print(f"✅ Arduino connected on {self.port}")
+                        return True
+                time.sleep(0.1)
+            
+            if self.serial_connection.is_open:
+                self.connected = True
+                print(f"✅ Arduino connected on {self.port} (no response)")
+                return True
+                
+        except serial.SerialException as e:
+            if "Access is denied" in str(e):
+                print(f"⚠️ Port {self.port} is in use! Close Arduino IDE or other programs.")
+            else:
+                print(f"⚠️ Arduino connection error: {e}")
+            print("   Running without Arduino hardware feedback")
+        except Exception as e:
+            print(f"⚠️ Arduino connection error: {e}")
+            print("   Running without Arduino hardware feedback")
+        
+        self.connected = False
+        return False
+    
+    def send_command(self, command, wait_response=False, timeout=1):
+        if not self.connected or not self.enabled or self.serial_connection is None:
+            return None
+        try:
+            if not command.endswith('\n'):
+                command += '\n'
+            self.serial_connection.write(command.encode())
+            if wait_response:
+                start_time = time.time()
+                while time.time() - start_time < timeout:
+                    if self.serial_connection.in_waiting:
+                        response = self.serial_connection.readline().decode().strip()
+                        return response
+                    time.sleep(0.05)
+                return None
+            return True
+        except Exception as e:
+            print(f"⚠️ Error sending to Arduino: {e}")
+            self.connected = False
+            return None
+    
+    def send_alert(self, alert_type, distance):
+        if not self.connected or not self.enabled or self.serial_connection is None:
+            return False
+        current_time = time.time()
+        if current_time - self.last_alert_time < self.alert_cooldown:
+            return False
+        try:
+            command = f"ALERT:{alert_type},{distance}\n"
+            self.serial_connection.write(command.encode())
+            self.last_alert_time = current_time
+            print(f"📟 Arduino Alert: {alert_type} at {distance}cm")
+            return True
+        except Exception as e:
+            print(f"⚠️ Error sending to Arduino: {e}")
+            self.connected = False
+            return False
+    
+    def stop_alert(self):
+        if not self.connected or not self.enabled or self.serial_connection is None:
+            return
+        try:
+            self.serial_connection.write(b"STOP\n")
+        except:
+            pass
+    
+    def check_heartbeat(self):
+        if not self.connected:
+            return False
+        try:
+            self.serial_connection.write(b"STATUS\n")
+            return True
+        except:
+            self.connected = False
+            return False
+    
+    def close(self):
+        if self.serial_connection and self.serial_connection.is_open:
+            try:
+                self.stop_alert()
+                self.serial_connection.close()
+            except:
+                pass
+            print("🔌 Arduino disconnected")
 
 class SmartBlindStick:
     def __init__(self):
@@ -35,79 +265,118 @@ class SmartBlindStick:
         print("🦯 Initializing Smart Blind Stick System")
         print("="*60)
         
-        # Generate unique device ID
-        self.device_id = hashlib.md5(str(time.time()).encode()).hexdigest()[:8]
+        # Device ID
+        self.device_id = DEVICE_ID
+        self.device_name = DEVICE_NAME
+        
+        # Register device in MongoDB
+        self.register_device()
+        
+        # Initialize Arduino (optional)
+        print("\n🔌 Checking for Arduino...")
+        self.arduino = ArduinoManager()
+        self.arduino.connect()
+        
+        # Initialize text-to-speech
+        print("\n🔊 Initializing Text-to-Speech...")
+        try:
+            self.engine = pyttsx3.init()
+            self.engine.setProperty('rate', 150)
+            self.engine.setProperty('volume', 0.9)
+            self.tts_available = True
+            print("✅ Text-to-speech initialized")
+        except Exception as e:
+            print(f"⚠️ Text-to-speech not available: {e}")
+            self.tts_available = False
+        
+        self.speech_queue = queue.Queue()
+        self.last_spoken = {}
+        self.speech_cooldown = {
+            'person': 2.0, 'stairs': 3.0, 'pothole': 2.5, 'wall': 2.5, 'vehicle': 2.0, 'emergency': 10.0
+        }
         
         # Load YOLO model
         print("\n📷 Loading YOLO model...")
-        self.model = None
-        self.model_loaded = False
-        
         try:
-            model_path = 'yolov8n.pt'
-            if not os.path.exists(model_path):
-                print("   ⬇️ Downloading YOLO model (first time only)...")
-                url = 'https://github.com/ultralytics/assets/releases/download/v0.0.0/yolov8n.pt'
-                urllib.request.urlretrieve(url, model_path)
-                print("   ✅ Model downloaded!")
-            
-            self.model = YOLO(model_path)
-            
-            # Test with dummy image
-            test_img = np.zeros((640, 640, 3), dtype=np.uint8)
-            self.model(test_img, verbose=False)
-            self.model_loaded = True
-            print("✅ YOLO model loaded and tested successfully!")
-            
+            self.model = YOLO('yolov8n.pt')
+            print("✅ YOLO model loaded!")
         except Exception as e:
-            print(f"❌ YOLO loading error: {e}")
+            print(f"⚠️ YOLO not available: {e}")
             self.model = None
-            self.model_loaded = False
         
+        # Important classes for detection
         self.important_classes = {
-            0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 
-            5: 'bus', 7: 'truck', 11: 'stop sign'
+            0: 'person', 1: 'bicycle', 2: 'car', 3: 'motorcycle', 5: 'bus',
+            7: 'truck', 11: 'stop sign'
         }
         
-        # State variables
+        # Camera setup
+        print("\n🎥 Opening camera...")
+        self.cap = None
+        for i in range(5):
+            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(i)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                self.cap = cap
+                print(f"✅ Camera {i} opened successfully!")
+                break
+            else:
+                cap.release()
+        
+        if self.cap is None:
+            print("❌ No camera found! Using test pattern.")
+            self.use_test_pattern = True
+        else:
+            self.use_test_pattern = False
+        
+        self.clients = set()
+        self.current_data = {}
+        self.emergency_mode = False
         self.person_count = 0
         self.vehicle_count = 0
         self.detected_objects = []
         self.fps = 0
-        self.emergency_mode = False
-        self.last_frame_time = time.time()
-        self.frame_count = 0
-        self.total_frames_processed = 0
-        self.total_detections_found = 0
+        self.detection_count = 0
+        self.location_update_count = 0
         
-        # Current location
+        # Get local IP
+        self.local_ip = self.get_local_ip()
+        
+        # Current location with more fields - EXACT LOCATION
         self.current_location = {
-            "lat": 11.2745,
-            "lng": 77.5831,
-            "address": "Perundurai, Tamil Nadu, India"
+            "lat": 0.0,
+            "lng": 0.0,
+            "address": "Getting exact location...",
+            "accuracy": 0,
+            "altitude": 0,
+            "speed": 0,
+            "heading": 0,
+            "source": "waiting",
+            "timestamp": datetime.now().isoformat()
         }
         
-        # Frame queue
-        self.frame_queue = queue.Queue(maxsize=10)
-        self.processing = False
-        self.last_detection = []
+        # Start threads
+        threading.Thread(target=self.process_speech_queue, daemon=True).start()
+        threading.Thread(target=self.arduino_heartbeat_check, daemon=True).start()
         
-        # Start processing thread
-        threading.Thread(target=self.process_frames, daemon=True).start()
-        
-        # Get network info
-        self.local_ip = self.get_local_ip()
+        # Log system start
+        self.log_system_event('SYSTEM_START', 'Smart Blind Stick system initialized')
         
         print("\n" + "="*60)
         print("✅ SYSTEM READY!")
         print(f"   Device ID: {self.device_id}")
-        print(f"   YOLO: {'✅ Loaded' if self.model_loaded else '❌ Not Available'}")
-        print(f"   Mode: {'☁️ Cloud Mode' if IS_RENDER else '💻 Local Mode'}")
-        print(f"   Port: {PORT}")
+        print(f"   Device Name: {self.device_name}")
+        print(f"   IP Address: {self.local_ip}")
+        print(f"   Arduino: {'✅ Connected' if self.arduino.connected else '⚠️ Not Connected'}")
+        print(f"   Camera: {'✅ OK' if self.cap else '⚠️ Test Pattern'}")
+        print(f"   TTS: {'✅ OK' if self.tts_available else '⚠️ Disabled'}")
+        print(f"   MongoDB: {'✅ Connected' if db is not None else '❌ Disabled'}")
         print("="*60 + "\n")
     
     def get_local_ip(self):
-        """Get local IP address"""
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
@@ -117,183 +386,529 @@ class SmartBlindStick:
         except:
             return "127.0.0.1"
     
-    def process_frames(self):
-        """Process frames in background"""
-        self.processing = True
-        print("🔍 Frame processing thread started")
-        
-        while self.processing:
+    def register_device(self):
+        """Register device in MongoDB"""
+        if db is None:
+            return
+        try:
+            db.device_registry.update_one(
+                {"device_id": self.device_id},
+                {"$set": {
+                    "device_id": self.device_id,
+                    "device_name": self.device_name,
+                    "ip_address": self.get_local_ip(),
+                    "status": "active",
+                    "registered_at": datetime.now(),
+                    "last_seen": datetime.now()
+                }},
+                upsert=True
+            )
+            print(f"✅ Device registered in MongoDB: {self.device_id}")
+        except Exception as e:
+            print(f"⚠️ Failed to register device: {e}")
+    
+    def arduino_heartbeat_check(self):
+        while True:
+            time.sleep(5)
+            if self.arduino.connected:
+                if not self.arduino.check_heartbeat():
+                    print("⚠️ Arduino connection lost! Attempting to reconnect...")
+                    self.arduino.connect()
+    
+    def process_speech_queue(self):
+        while True:
             try:
-                frame_data = self.frame_queue.get(timeout=1.0)
-                if frame_data is None:
-                    continue
+                text = self.speech_queue.get(timeout=1)
+                if self.tts_available:
+                    self.engine.say(text)
+                    self.engine.runAndWait()
+                else:
+                    print(f"🔊 VOICE: {text}")
+                self.speech_queue.task_done()
+            except:
+                pass
+    
+    def speak(self, text, alert_type='obstacle'):
+        now = time.time()
+        if alert_type in self.last_spoken:
+            if now - self.last_spoken[alert_type] < self.speech_cooldown.get(alert_type, 2):
+                return
+        self.last_spoken[alert_type] = now
+        self.speech_queue.put(text)
+        
+        # Log to MongoDB
+        self.save_alert_to_db(alert_type, text)
+        
+        print(f"🔊 Speaking: {text}")
+    
+    def save_alert_to_db(self, alert_type, message):
+        """Save alert to MongoDB"""
+        if db is None:
+            return
+        try:
+            db.alerts.insert_one({
+                "device_id": self.device_id,
+                "device_name": self.device_name,
+                "alert_type": alert_type,
+                "message": message,
+                "location": self.current_location,
+                "person_count": self.person_count,
+                "vehicle_count": self.vehicle_count,
+                "ip_address": self.local_ip,
+                "timestamp": datetime.now()
+            })
+        except Exception as e:
+            print(f"⚠️ Failed to save alert: {e}")
+    
+    def save_detection_to_db(self, detection):
+        """Save detection to MongoDB"""
+        if db is None:
+            return
+        try:
+            db.detections.insert_one({
+                "device_id": self.device_id,
+                "device_name": self.device_name,
+                "object_type": detection.get('class'),
+                "confidence": detection.get('confidence'),
+                "distance": detection.get('distance'),
+                "distance_cm": detection.get('distance_cm'),
+                "direction": detection.get('direction'),
+                "location": self.current_location,
+                "ip_address": self.local_ip,
+                "timestamp": datetime.now()
+            })
+        except Exception as e:
+            print(f"⚠️ Failed to save detection: {e}")
+    
+    def save_location_to_db(self):
+        """Save current location to MongoDB"""
+        if db is None:
+            return
+        try:
+            # Update live location
+            db.live_locations.update_one(
+                {"device_id": self.device_id},
+                {"$set": {
+                    "device_name": self.device_name,
+                    "latitude": self.current_location.get('lat'),
+                    "longitude": self.current_location.get('lng'),
+                    "address": self.current_location.get('address'),
+                    "accuracy": self.current_location.get('accuracy', 0),
+                    "altitude": self.current_location.get('altitude', 0),
+                    "speed": self.current_location.get('speed', 0),
+                    "heading": self.current_location.get('heading', 0),
+                    "source": self.current_location.get('source', 'unknown'),
+                    "ip_address": self.local_ip,
+                    "timestamp": datetime.now()
+                }},
+                upsert=True
+            )
+            
+            # Insert location history
+            db.location_tracking.insert_one({
+                "device_id": self.device_id,
+                "device_name": self.device_name,
+                "latitude": self.current_location.get('lat'),
+                "longitude": self.current_location.get('lng'),
+                "address": self.current_location.get('address'),
+                "accuracy": self.current_location.get('accuracy', 0),
+                "altitude": self.current_location.get('altitude', 0),
+                "speed": self.current_location.get('speed', 0),
+                "heading": self.current_location.get('heading', 0),
+                "source": self.current_location.get('source', 'unknown'),
+                "ip_address": self.local_ip,
+                "timestamp": datetime.now()
+            })
+            
+            self.location_update_count += 1
+            if self.location_update_count % 10 == 0:
+                print(f"📍 Exact Location saved to MongoDB: {self.current_location.get('lat')}, {self.current_location.get('lng')} (Accuracy: {self.current_location.get('accuracy', 0)}m)")
                 
-                try:
-                    image_bytes = base64.b64decode(frame_data)
-                    np_arr = np.frombuffer(image_bytes, np.uint8)
-                    frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-                    
-                    if frame is None:
-                        continue
-                    
-                    self.total_frames_processed += 1
-                    
-                    # Resize for performance
-                    height, width = frame.shape[:2]
-                    if width > 480:
-                        scale = 480 / width
-                        new_width = 480
-                        new_height = int(height * scale)
-                        frame = cv2.resize(frame, (new_width, new_height))
-                    
-                    # Detect objects
-                    detections = self.detect_with_yolo(frame)
-                    
-                    # Update stats
-                    self.person_count = sum(1 for d in detections if d['class'] == 'person')
-                    self.vehicle_count = sum(1 for d in detections if d['class'] in ['car', 'truck', 'bus', 'bicycle', 'motorcycle'])
-                    self.detected_objects = detections
-                    
-                    if len(detections) > 0:
-                        self.total_detections_found += len(detections)
-                        print(f"✅ Detected {len(detections)} objects")
-                    
-                    # Calculate FPS
-                    self.frame_count += 1
-                    current_time = time.time()
-                    if current_time - self.last_frame_time >= 1.0:
-                        self.fps = self.frame_count
-                        self.frame_count = 0
-                        self.last_frame_time = current_time
-                    
-                    self.last_detection = detections
-                    
-                    # Store in shared view
-                    self.store_shared_view()
-                    
-                except Exception as e:
-                    print(f"⚠️ Frame processing error: {e}")
-                    continue
-                    
-            except queue.Empty:
-                continue
-            except Exception as e:
-                print(f"⚠️ Unexpected error: {e}")
-                continue
+        except Exception as e:
+            print(f"⚠️ Failed to save location: {e}")
+    
+    def log_system_event(self, event_type, details):
+        """Log system event to MongoDB"""
+        if db is None:
+            return
+        try:
+            db.system_logs.insert_one({
+                "device_id": self.device_id,
+                "device_name": self.device_name,
+                "event_type": event_type,
+                "details": details,
+                "ip_address": self.local_ip,
+                "timestamp": datetime.now()
+            })
+        except Exception as e:
+            print(f"⚠️ Failed to log system event: {e}")
+    
+    def send_arduino_alert(self, alert_type, distance_cm):
+        if self.arduino.connected and distance_cm < 100:
+            self.arduino.send_alert(alert_type, distance_cm)
     
     def detect_with_yolo(self, frame):
-        """Run YOLO detection"""
         detections = []
         height, width = frame.shape[:2]
         
-        if self.model is None or not self.model_loaded:
-            return detections
+        if self.model is None:
+            return frame, detections
+        
+        results = self.model(frame, stream=True, conf=0.5)
+        
+        for r in results:
+            boxes = r.boxes
+            if boxes is not None:
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    
+                    if conf < 0.5:
+                        continue
+                    
+                    class_name = self.important_classes.get(cls, f"object")
+                    x1, y1, x2, y2 = map(int, box.xyxy[0])
+                    
+                    box_height = y2 - y1
+                    
+                    if box_height > height * 0.5:
+                        distance = "very close"
+                        distance_cm = 30
+                        color = (0, 0, 255)
+                    elif box_height > height * 0.3:
+                        distance = "close"
+                        distance_cm = 60
+                        color = (0, 165, 255)
+                    elif box_height > height * 0.15:
+                        distance = "medium"
+                        distance_cm = 120
+                        color = (0, 255, 255)
+                    else:
+                        distance = "far"
+                        distance_cm = 200
+                        color = (0, 255, 0)
+                    
+                    center_x = (x1 + x2) / 2
+                    if center_x < width * 0.3:
+                        direction = "left"
+                    elif center_x > width * 0.7:
+                        direction = "right"
+                    else:
+                        direction = "center"
+                    
+                    detection = {
+                        'class': class_name,
+                        'confidence': conf,
+                        'distance': distance,
+                        'distance_cm': distance_cm,
+                        'direction': direction,
+                        'bbox': (x1, y1, x2, y2)
+                    }
+                    detections.append(detection)
+                    
+                    # Save to MongoDB
+                    self.save_detection_to_db(detection)
+                    
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    label = f"{class_name}: {conf:.2f} ({distance}, {direction})"
+                    cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    
+                    if class_name == 'person':
+                        if distance == "very close":
+                            self.speak(f"Person {direction}, very close!", 'person')
+                            self.send_arduino_alert('PERSON', distance_cm)
+                        elif distance == "close":
+                            self.speak(f"Person {direction}", 'person')
+                            self.send_arduino_alert('PERSON', distance_cm)
+                        self.detection_count += 1
+                        
+                    elif class_name in ['car', 'truck', 'bus', 'bicycle', 'motorcycle']:
+                        if distance in ["very close", "close"]:
+                            self.speak(f"Vehicle {direction}, {distance}!", 'vehicle')
+                            self.send_arduino_alert('VEHICLE', distance_cm)
+                        self.detection_count += 1
+        
+        return frame, detections
+    
+    def generate_frames(self):
+        fps_start = time.time()
+        frame_count = 0
+        
+        while True:
+            if self.use_test_pattern or self.cap is None:
+                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(frame, "SMART BLIND STICK SYSTEM", (150, 200), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(frame, "Waiting for camera...", (200, 240), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                cv2.putText(frame, "Connect a camera to see real-time detection", (120, 280), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                detections = []
+            else:
+                ret, frame = self.cap.read()
+                if not ret:
+                    frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                    cv2.putText(frame, "Camera Error", (240, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                else:
+                    frame_count += 1
+                    if frame_count % 30 == 0:
+                        elapsed = time.time() - fps_start
+                        self.fps = int(30 / elapsed) if elapsed > 0 else 30
+                        fps_start = time.time()
+                    
+                    frame, detections = self.detect_with_yolo(frame)
+            
+            self.person_count = sum(1 for d in detections if d['class'] == 'person')
+            self.vehicle_count = sum(1 for d in detections if d['class'] in ['car', 'truck', 'bus', 'bicycle', 'motorcycle'])
+            self.detected_objects = detections
+            
+            y_offset = 30
+            cv2.putText(frame, "SMART BLIND STICK SYSTEM", (10, y_offset), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            
+            if self.arduino.connected:
+                cv2.putText(frame, "Arduino: ✅ Connected", (10, y_offset + 25), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            else:
+                cv2.putText(frame, "Arduino: ⚠️ Software Mode", (10, y_offset + 25), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1)
+            
+            cv2.putText(frame, f"FPS: {self.fps} | Persons: {self.person_count} | Vehicles: {self.vehicle_count}", 
+                       (10, y_offset + 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+            cv2.putText(frame, f"Mobile Connected: {len(self.clients)}", (10, y_offset + 75), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+            
+            # Display exact location with accuracy
+            loc_text = f"📍 {self.current_location.get('address', 'Unknown')[:30]}"
+            cv2.putText(frame, loc_text, (10, y_offset + 100), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,0), 1)
+            
+            acc_text = f"Accuracy: {self.current_location.get('accuracy', 0)}m | Source: {self.current_location.get('source', 'unknown')}"
+            cv2.putText(frame, acc_text, (10, y_offset + 118), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,255,0), 1)
+            
+            cv2.putText(frame, f"Device: {self.device_name} | IP: {self.local_ip}", (10, y_offset + 138), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255,255,255), 1)
+            
+            if self.emergency_mode:
+                cv2.putText(frame, "EMERGENCY MODE ACTIVE", (10, y_offset + 158), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            
+            self.current_data = {
+                'device_id': self.device_id,
+                'device_name': self.device_name,
+                'detections': detections,
+                'person_count': self.person_count,
+                'vehicle_count': self.vehicle_count,
+                'fps': self.fps,
+                'emergency': self.emergency_mode,
+                'location': self.current_location,
+                'timestamp': datetime.now().isoformat(),
+                'connected_clients': len(self.clients),
+                'detection_count': self.detection_count,
+                'arduino_connected': self.arduino.connected,
+                'ip_address': self.local_ip
+            }
+            
+            frame = np.ascontiguousarray(frame)
+            ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+    
+    async def handle_client(self, websocket):
+        self.clients.add(websocket)
+        print(f"📱 Mobile connected! Total: {len(self.clients)}")
         
         try:
-            results = self.model(frame, stream=True, conf=0.2, iou=0.45, verbose=False)
+            if self.current_data:
+                await websocket.send(json.dumps(self.current_data))
             
-            for r in results:
-                boxes = r.boxes
-                if boxes is not None and len(boxes) > 0:
-                    for box in boxes:
-                        cls = int(box.cls[0])
-                        conf = float(box.conf[0])
+            async for message in websocket:
+                try:
+                    data = json.loads(message)
+                    if data.get('type') == 'register':
+                        await websocket.send(json.dumps({
+                            'type': 'registered', 
+                            'status': 'ok',
+                            'device_id': self.device_id,
+                            'device_name': self.device_name
+                        }))
+                    elif data.get('type') == 'request_location':
+                        await websocket.send(json.dumps({
+                            'type': 'location_update',
+                            'location': self.current_location
+                        }))
+                    elif data.get('type') == 'location_update':
+                        lat = data.get('lat')
+                        lng = data.get('lng')
+                        address = data.get('address')
+                        accuracy = data.get('accuracy', 0)
+                        altitude = data.get('altitude', 0)
+                        speed = data.get('speed', 0)
+                        heading = data.get('heading', 0)
                         
-                        if cls not in self.important_classes or conf < 0.2:
-                            continue
-                        
-                        class_name = self.important_classes[cls]
-                        x1, y1, x2, y2 = map(int, box.xyxy[0])
-                        
-                        # Calculate distance
-                        box_height = y2 - y1
-                        box_width = x2 - x1
-                        area_ratio = (box_height * box_width) / (height * width)
-                        
-                        if area_ratio > 0.3:
-                            distance = "very close"
-                            distance_cm = 30
-                        elif area_ratio > 0.15:
-                            distance = "close"
-                            distance_cm = 60
-                        elif area_ratio > 0.05:
-                            distance = "medium"
-                            distance_cm = 120
-                        else:
-                            distance = "far"
-                            distance_cm = 200
-                        
-                        center_x = (x1 + x2) / 2
-                        if center_x < width * 0.3:
-                            direction = "left"
-                        elif center_x > width * 0.7:
-                            direction = "right"
-                        else:
-                            direction = "center"
-                        
-                        detections.append({
-                            'class': class_name,
-                            'confidence': round(conf, 3),
-                            'distance': distance,
-                            'distance_cm': distance_cm,
-                            'direction': direction
-                        })
-            
+                        if lat is not None and lng is not None:
+                            # Update exact location
+                            self.current_location = {
+                                "lat": lat,
+                                "lng": lng,
+                                "address": address or f"{lat:.6f}, {lng:.6f}",
+                                "accuracy": accuracy,
+                                "altitude": altitude,
+                                "speed": speed,
+                                "heading": heading,
+                                "source": "GPS_HighAccuracy" if accuracy < 20 else "GPS" if accuracy < 100 else "WiFi",
+                                "timestamp": datetime.now().isoformat()
+                            }
+                            # Save to MongoDB
+                            self.save_location_to_db()
+                            self.log_system_event('LOCATION_UPDATE', 
+                                f"Exact Location: {self.current_location['address']} (Accuracy: {accuracy}m)")
+                            print(f"📍 EXACT LOCATION: {lat}, {lng} (Accuracy: {accuracy}m, Source: {self.current_location['source']})")
+                    elif data.get('type') == 'emergency':
+                        await self.handle_emergency_request()
+                except Exception as e:
+                    print(f"WebSocket message error: {e}")
         except Exception as e:
-            print(f"❌ Detection error: {e}")
-        
-        return detections
+            print(f"WebSocket error: {e}")
+        finally:
+            self.clients.remove(websocket)
+            print(f"📱 Mobile disconnected. Total: {len(self.clients)}")
     
-    def store_shared_view(self):
-        """Store current detection results for sharing"""
-        global device_views
+    async def handle_emergency_request(self):
+        self.emergency_mode = True
+        self.speak("EMERGENCY! Help needed!", "emergency")
+        await self.send_emergency(self.current_location, self.person_count)
         
-        data = {
+        def reset():
+            time.sleep(30)
+            self.emergency_mode = False
+        threading.Thread(target=reset, daemon=True).start()
+    
+    async def broadcast_updates(self):
+        while True:
+            if self.clients and self.current_data:
+                dead = set()
+                for client in self.clients:
+                    try:
+                        await client.send(json.dumps(self.current_data))
+                    except:
+                        dead.add(client)
+                self.clients -= dead
+            await asyncio.sleep(0.1)
+    
+    def run_websocket(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self.ws_loop = loop
+        
+        async def server():
+            async with websockets.serve(self.handle_client, '0.0.0.0', 8765):
+                print("🔌 WebSocket server running on ws://0.0.0.0:8765")
+                await asyncio.gather(self.broadcast_updates(), asyncio.Future())
+        
+        loop.run_until_complete(server())
+    
+    async def send_emergency(self, location, person_count):
+        maps_url = f"https://www.google.com/maps?q={location['lat']},{location['lng']}"
+        
+        emergency_data = {
+            'type': 'emergency',
+            'title': '🚨 EMERGENCY ALERT! 🚨',
+            'message': f'Emergency button pressed! Immediate assistance needed!',
+            'location': location,
+            'maps_url': maps_url,
+            'person_count': person_count,
             'device_id': self.device_id,
-            'timestamp': datetime.now().isoformat(),
-            'person_count': self.person_count,
-            'vehicle_count': self.vehicle_count,
-            'fps': self.fps,
-            'detections': self.last_detection[:15],
-            'location': self.current_location,
-            'emergency': self.emergency_mode,
-            'active': True,
-            'last_update': time.time(),
-            'model_loaded': self.model_loaded,
-            'total_frames': self.total_frames_processed,
-            'total_detections': self.total_detections_found
+            'device_name': self.device_name,
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
         
-        device_views[self.device_id] = data
+        print(f"\n{'='*60}")
+        print("🚨 EMERGENCY ALERT SENT!")
+        print(f"{'='*60}")
+        print(f"📍 EXACT Location: {location['address']}")
+        print(f"📍 Coordinates: {location['lat']}, {location['lng']}")
+        print(f"📍 Accuracy: {location.get('accuracy', 0)}m")
+        print(f"📍 Source: {location.get('source', 'unknown')}")
+        print(f"📍 Google Maps: {maps_url}")
+        print(f"👥 Persons detected: {person_count}")
+        print(f"📱 Device: {self.device_name}")
+        print(f"🌐 IP: {self.local_ip}")
         
-        # Clean old entries
-        current_time = time.time()
-        for device_id in list(device_views.keys()):
-            if current_time - device_views[device_id].get('last_update', 0) > 15:
-                device_views[device_id]['active'] = False
+        # Trigger Arduino emergency
+        if self.arduino.connected:
+            self.arduino.send_alert('EMERGENCY', 0)
+        
+        # Save to MongoDB
+        if db is not None:
+            try:
+                db.emergency_events.insert_one({
+                    "device_id": self.device_id,
+                    "device_name": self.device_name,
+                    "location": location,
+                    "person_count": person_count,
+                    "vehicle_count": self.vehicle_count,
+                    "ip_address": self.local_ip,
+                    "timestamp": datetime.now()
+                })
+                db.alerts.insert_one({
+                    "device_id": self.device_id,
+                    "device_name": self.device_name,
+                    "alert_type": "emergency",
+                    "message": f"🚨 EMERGENCY: Alert triggered at {location.get('address', 'Unknown location')}",
+                    "location": location,
+                    "person_count": person_count,
+                    "ip_address": self.local_ip,
+                    "timestamp": datetime.now()
+                })
+                print("✅ Emergency logged to MongoDB")
+            except Exception as e:
+                print(f"⚠️ Failed to log emergency: {e}")
+        
+        # Send to all connected clients
+        if self.clients:
+            for client in self.clients:
+                try:
+                    await client.send(json.dumps(emergency_data))
+                    print("✅ Alert sent to mobile")
+                except Exception as e:
+                    print(f"❌ Failed: {e}")
+        
+        print(f"{'='*60}\n")
+        return emergency_data
     
-    def get_current_data(self):
-        """Get current detection data"""
-        return {
-            'device_id': self.device_id,
-            'detections': self.last_detection[:15],
-            'person_count': self.person_count,
-            'vehicle_count': self.vehicle_count,
-            'fps': self.fps,
-            'emergency': self.emergency_mode,
-            'location': self.current_location,
-            'timestamp': datetime.now().isoformat(),
-            'total_detections': len(self.last_detection),
-            'debug': {
-                'model_loaded': self.model_loaded,
-                'frames_processed': self.total_frames_processed,
-                'total_detections_found': self.total_detections_found,
-                'queue_size': self.frame_queue.qsize()
-            }
-        }
+    def run(self):
+        ws_thread = threading.Thread(target=self.run_websocket, daemon=True)
+        ws_thread.start()
+        
+        self.speak("Smart Blind Stick system started", "system")
+        
+        print("\n" + "="*60)
+        print("🌐 SERVER RUNNING!")
+        print("="*60)
+        print(f"📱 Open on your MOBILE PHONE: http://{self.local_ip}:5000")
+        print(f"💻 Open on this computer: http://127.0.0.1:5000")
+        print(f"🔌 WebSocket: ws://{self.local_ip}:8765")
+        print(f"📱 Device ID: {self.device_id}")
+        print(f"📱 Device Name: {self.device_name}")
+        print(f"📊 MongoDB: {'✅ Connected' if db is not None else '❌ Disabled'}")
+        print("\n💡 TIPS:")
+        print("   • All detections and alerts are saved to MongoDB Atlas")
+        print("   • EXACT LOCATION tracking with GPS + WiFi fallback")
+        print("   • Location accuracy shown in meters")
+        print("   • Press 'E' key on keyboard for emergency alert")
+        print("="*60 + "\n")
+    
+    def cleanup(self):
+        self.arduino.close()
+        if self.cap:
+            self.cap.release()
+        if mongo_client:
+            mongo_client.close()
+            print("🔌 MongoDB connection closed")
 
 # ============================================
-# HTML TEMPLATE - FIXED VERSION
+# HTML TEMPLATE with Connection Links at Bottom
 # ============================================
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
@@ -305,99 +920,31 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #0a0a1a 0%, #1a1a3e 100%);
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
             min-height: 100vh;
-            padding: 12px;
+            padding: 16px;
             color: #fff;
-            touch-action: manipulation;
         }
         .container { max-width: 500px; margin: 0 auto; }
-        
-        .header {
-            text-align: center;
-            padding: 10px 0 15px 0;
-        }
-        .header h1 { 
-            font-size: 22px; 
-            background: linear-gradient(135deg, #4caf50, #2196f3); 
-            -webkit-background-clip: text; 
-            -webkit-text-fill-color: transparent; 
-        }
-        .header .subtitle { 
-            font-size: 12px; 
-            opacity: 0.6; 
-            color: #888;
-        }
-        
-        .status-bar {
-            display: flex;
-            justify-content: center;
-            gap: 6px;
-            flex-wrap: wrap;
-            margin-bottom: 12px;
-        }
+        h1 { text-align: center; font-size: 24px; margin-bottom: 20px; }
+        .status { text-align: center; margin-bottom: 20px; }
         .badge {
-            padding: 3px 10px;
+            display: inline-block;
+            padding: 5px 12px;
             border-radius: 20px;
-            font-size: 10px;
-            font-weight: 600;
+            font-size: 12px;
+            margin: 5px;
         }
-        .badge-success { background: rgba(76,175,80,0.2); border: 1px solid #4caf50; color: #4caf50; }
-        .badge-danger { background: rgba(244,67,54,0.2); border: 1px solid #f44336; color: #f44336; }
-        .badge-warning { background: rgba(255,193,7,0.2); border: 1px solid #ffc107; color: #ffc107; }
-        .badge-info { background: rgba(33,150,243,0.2); border: 1px solid #2196f3; color: #2196f3; }
-        
+        .connected { background: rgba(76,175,80,0.3); border: 1px solid #4caf50; color: #4caf50; }
+        .disconnected { background: rgba(244,67,54,0.3); border: 1px solid #f44336; color: #f44336; }
+        .warning { background: rgba(255,193,7,0.3); border: 1px solid #ffc107; color: #ffc107; }
         .video-container {
             background: #000;
             border-radius: 16px;
             overflow: hidden;
-            margin-bottom: 12px;
-            position: relative;
-            aspect-ratio: 4/3;
-            border: 1px solid rgba(255,255,255,0.1);
+            margin-bottom: 16px;
         }
-        #video {
-            width: 100%;
-            height: 100%;
-            object-fit: cover;
-            display: block;
-            background: #111;
-        }
-        .video-overlay {
-            position: absolute;
-            top: 10px;
-            left: 10px;
-            right: 10px;
-            display: flex;
-            justify-content: space-between;
-            pointer-events: none;
-        }
-        .video-overlay .left {
-            background: rgba(0,0,0,0.7);
-            padding: 4px 10px;
-            border-radius: 8px;
-            font-size: 11px;
-            color: #fff;
-        }
-        .video-overlay .right {
-            background: rgba(0,0,0,0.7);
-            padding: 4px 10px;
-            border-radius: 8px;
-            font-size: 11px;
-            color: #4caf50;
-        }
-        .video-overlay .fps { color: #4caf50; font-weight: bold; }
-        .video-placeholder {
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            height: 100%;
-            color: rgba(255,255,255,0.5);
-            font-size: 14px;
-        }
-        .video-placeholder .icon { font-size: 48px; margin-bottom: 10px; }
-        
+        .video-container img { width: 100%; display: block; }
         .emergency-btn {
             background: linear-gradient(135deg, #ff4444, #cc0000);
             border: none;
@@ -408,670 +955,750 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             font-size: 18px;
             font-weight: bold;
             cursor: pointer;
-            margin-bottom: 12px;
+            margin-bottom: 16px;
             animation: pulse 2s infinite;
-            box-shadow: 0 4px 20px rgba(255,68,68,0.3);
-            touch-action: manipulation;
         }
         @keyframes pulse {
-            0%,100% { transform: scale(1); box-shadow: 0 4px 20px rgba(255,68,68,0.3); }
-            50% { transform: scale(1.02); box-shadow: 0 4px 30px rgba(255,68,68,0.5); }
+            0%,100% { transform: scale(1); }
+            50% { transform: scale(1.02); }
         }
-        .emergency-btn:active { transform: scale(0.95); }
-        
-        .stats-grid {
+        .card {
+            background: rgba(255,255,255,0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 16px;
+            padding: 15px;
+            margin-bottom: 16px;
+        }
+        .stats {
             display: grid;
             grid-template-columns: repeat(3, 1fr);
-            gap: 8px;
-            margin-bottom: 12px;
+            gap: 10px;
         }
-        .stat-card {
-            background: rgba(255,255,255,0.05);
-            padding: 12px;
-            border-radius: 12px;
+        .stat {
             text-align: center;
-            border: 1px solid rgba(255,255,255,0.05);
+            background: rgba(0,0,0,0.4);
+            padding: 10px;
+            border-radius: 10px;
         }
-        .stat-value { font-size: 22px; font-weight: bold; color: #4caf50; }
-        .stat-label { font-size: 11px; opacity: 0.6; margin-top: 3px; }
-        
+        .stat-value { font-size: 24px; font-weight: bold; color: #4caf50; }
+        .stat-label { font-size: 12px; opacity: 0.7; margin-top: 5px; }
         .detection-list {
-            background: rgba(255,255,255,0.05);
-            border-radius: 12px;
-            padding: 12px;
-            max-height: 180px;
+            max-height: 300px;
             overflow-y: auto;
-            margin-bottom: 12px;
-            border: 1px solid rgba(255,255,255,0.05);
         }
         .detection-item {
-            padding: 6px 0;
-            border-bottom: 1px solid rgba(255,255,255,0.05);
+            background: rgba(0,0,0,0.4);
+            padding: 10px;
+            margin: 5px 0;
+            border-radius: 10px;
             display: flex;
             justify-content: space-between;
-            font-size: 13px;
         }
-        .detection-item:last-child { border-bottom: none; }
-        .detection-item .emoji { margin-right: 8px; }
-        .detection-item .conf { color: #4caf50; font-weight: bold; }
-        .detection-item .distance-very-close { color: #f44336; }
-        .detection-item .distance-close { color: #ff9800; }
-        .detection-item .distance-medium { color: #ffc107; }
-        .detection-item .distance-far { color: #4caf50; }
-        
-        .location-card {
-            background: rgba(255,255,255,0.05);
-            border-radius: 12px;
-            padding: 12px;
-            border: 1px solid rgba(255,255,255,0.05);
-            margin-bottom: 12px;
+        .detection-danger { border-left: 3px solid #ff4444; }
+        .detection-warning { border-left: 3px solid #ff9800; }
+        .alert-list {
+            max-height: 200px;
+            overflow-y: auto;
         }
-        .location-card .label { font-size: 11px; opacity: 0.6; }
-        .location-card .address { font-size: 14px; font-weight: 500; margin: 4px 0; }
-        .location-card .coords { font-size: 12px; opacity: 0.7; }
-        .location-card button {
-            margin-top: 8px;
-            padding: 8px 16px;
-            border: none;
-            border-radius: 8px;
-            background: #4caf50;
-            color: #fff;
-            font-size: 12px;
-            font-weight: 600;
-            cursor: pointer;
-            width: 100%;
-        }
-        
-        .controls {
-            display: flex;
-            gap: 8px;
-            margin-bottom: 12px;
-        }
-        .controls button {
-            flex: 1;
+        .alert-item {
+            background: rgba(0,0,0,0.4);
             padding: 10px;
-            border: none;
+            margin: 5px 0;
             border-radius: 10px;
-            font-size: 13px;
-            font-weight: 600;
-            cursor: pointer;
-            background: rgba(255,255,255,0.1);
-            color: white;
-            touch-action: manipulation;
+            border-left: 3px solid #ff9800;
         }
-        .controls button:active { transform: scale(0.95); }
-        .controls .btn-camera { background: rgba(33,150,243,0.3); color: #2196f3; }
-        .controls .btn-camera.active { background: rgba(76,175,80,0.3); color: #4caf50; }
-        
-        .dashboard-links {
-            background: rgba(255,255,255,0.05);
-            border-radius: 16px;
-            padding: 16px;
-            margin: 12px 0;
+        .alert-emergency {
+            border-left-color: #ff4444;
+            animation: blink 0.5s;
+        }
+        @keyframes blink {
+            0%,100% { background: rgba(255,68,68,0.2); }
+            50% { background: rgba(255,68,68,0.4); }
+        }
+        .location {
+            font-size: 12px;
+            text-align: center;
+            margin-top: 10px;
+            word-wrap: break-word;
+        }
+        .location .coords { font-size: 11px; opacity: 0.7; }
+        .location .accuracy { font-size: 10px; opacity: 0.5; }
+        .device-info {
+            font-size: 10px;
+            opacity: 0.5;
+            text-align: center;
+            margin-top: 5px;
+        }
+        #map {
+            height: 250px;
+            border-radius: 12px;
+            margin-top: 10px;
+            margin-bottom: 10px;
             border: 1px solid rgba(255,255,255,0.1);
         }
-        .dashboard-links .title {
+        .map-btn {
+            width: 100%;
+            padding: 10px;
+            background: #4caf50;
+            border: none;
+            border-radius: 8px;
+            color: white;
+            cursor: pointer;
+            font-weight: bold;
+        }
+        .map-btn:hover { background: #45a049; }
+        
+        /* Connection Links Section - At Bottom */
+        .connection-section {
+            background: rgba(0,0,0,0.4);
+            border-radius: 16px;
+            padding: 16px;
+            margin-top: 16px;
+            border: 1px solid rgba(255,255,255,0.1);
+        }
+        .connection-section h3 {
             font-size: 14px;
-            font-weight: 600;
             margin-bottom: 12px;
             color: #4caf50;
             text-align: center;
         }
-        .dashboard-links .link-item {
-            background: rgba(0,0,0,0.3);
-            border-radius: 10px;
+        .connection-link {
+            background: rgba(255,255,255,0.05);
             padding: 12px;
+            border-radius: 10px;
             margin-bottom: 10px;
+            word-break: break-all;
         }
-        .dashboard-links .link-item:last-child { margin-bottom: 0; }
-        .dashboard-links .link-label {
-            font-size: 11px;
-            opacity: 0.6;
+        .connection-link .label {
+            font-size: 10px;
+            opacity: 0.5;
             margin-bottom: 4px;
         }
-        .dashboard-links .link-url {
-            font-size: 13px;
+        .connection-link .url {
+            font-size: 14px;
+            font-weight: 500;
+            color: #2196f3;
             font-family: monospace;
-            word-break: break-all;
-            color: #4caf50;
-            background: rgba(0,0,0,0.2);
-            padding: 6px 10px;
-            border-radius: 6px;
-            display: block;
-        }
-        .dashboard-links .copy-btn {
-            background: rgba(76,175,80,0.2);
-            border: 1px solid #4caf50;
-            color: #4caf50;
-            padding: 4px 12px;
-            border-radius: 4px;
-            font-size: 11px;
             cursor: pointer;
+        }
+        .connection-link .url:hover { color: #4caf50; }
+        .connection-link .copy-btn {
+            background: rgba(33,150,243,0.3);
+            border: 1px solid #2196f3;
+            color: #2196f3;
+            padding: 4px 12px;
+            border-radius: 6px;
+            font-size: 10px;
+            cursor: pointer;
+            margin-top: 6px;
+        }
+        .connection-link .copy-btn:hover { background: rgba(33,150,243,0.5); }
+        .qr-container {
+            text-align: center;
+            margin: 10px 0;
+        }
+        .qr-container img {
+            width: 150px;
+            height: 150px;
+            background: white;
+            padding: 10px;
+            border-radius: 12px;
+        }
+        .device-id-display {
+            text-align: center;
+            font-size: 11px;
+            opacity: 0.6;
+            margin-top: 8px;
+            font-family: monospace;
+        }
+        
+        /* Mobile connected devices list */
+        .connected-devices {
+            margin-top: 10px;
+        }
+        .connected-devices .device-item {
+            background: rgba(76,175,80,0.1);
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 11px;
+            margin: 3px 0;
+            border-left: 2px solid #4caf50;
+        }
+        
+        /* Accuracy badge */
+        .accuracy-badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 10px;
             margin-top: 4px;
         }
-        .dashboard-links .copy-btn:active { transform: scale(0.95); }
-        .dashboard-links .device-info {
-            font-size: 11px;
-            opacity: 0.5;
-            margin-top: 8px;
-            text-align: center;
-        }
-        
-        .debug-info {
-            font-size: 10px;
-            opacity: 0.4;
-            text-align: center;
-            padding: 8px;
-            background: rgba(0,0,0,0.3);
-            border-radius: 8px;
-            font-family: monospace;
-            margin-top: 8px;
-        }
-        
-        .hidden { display: none; }
-        
-        ::-webkit-scrollbar { width: 3px; }
-        ::-webkit-scrollbar-track { background: rgba(255,255,255,0.05); border-radius: 10px; }
-        ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 10px; }
+        .accuracy-high { background: rgba(76,175,80,0.3); color: #4caf50; border: 1px solid #4caf50; }
+        .accuracy-medium { background: rgba(255,193,7,0.3); color: #ffc107; border: 1px solid #ffc107; }
+        .accuracy-low { background: rgba(244,67,54,0.3); color: #f44336; border: 1px solid #f44336; }
     </style>
 </head>
 <body>
     <div class="container">
-        <div class="header">
-            <h1>🦯 Smart Blind Stick</h1>
-            <div class="subtitle">Real-time Object Detection & GPS Tracking</div>
-        </div>
+        <h1>🦯 Smart Blind Stick</h1>
         
-        <div class="status-bar">
-            <span id="cameraStatus" class="badge badge-warning">📷 Click Start</span>
-            <span id="gpsStatus" class="badge badge-warning">📍 GPS...</span>
-            <span id="serverStatus" class="badge badge-success">🌐 Connected</span>
-            <span id="modelStatus" class="badge badge-warning">🤖 Loading...</span>
-        </div>
-        
-        <div class="dashboard-links">
-            <div class="title">🔗 Connection Links</div>
-            <div class="link-item">
-                <div class="link-label">📱 Mobile / 💻 Laptop</div>
-                <span class="link-url" id="mainUrl">Loading...</span>
-                <button class="copy-btn" onclick="copyUrl('mainUrl')">📋 Copy</button>
-            </div>
-            <div class="device-info" id="deviceInfo">Device ID: Loading...</div>
+        <div class="status">
+            <span id="wsStatus" class="badge disconnected">🔴 Connecting...</span>
+            <span id="arduinoStatus" class="badge disconnected">🔌 Arduino: Unknown</span>
+            <span id="dbStatus" class="badge disconnected">📊 DB: Unknown</span>
         </div>
         
         <div class="video-container">
-            <video id="video" autoplay playsinline muted></video>
-            <div class="video-overlay">
-                <span class="left" id="detectionOverlay">👤 0 | 🚗 0</span>
-                <span class="right"><span class="fps" id="fpsOverlay">0</span> FPS</span>
-            </div>
-            <div id="videoPlaceholder" class="video-placeholder">
-                <div class="icon">📷</div>
-                <div>Tap "Start Camera" below</div>
-                <div style="font-size:11px;margin-top:8px;opacity:0.5;">Camera access required</div>
-            </div>
+            <img id="videoFeed" src="/video_feed" alt="Camera Feed">
         </div>
         
-        <div class="controls">
-            <button class="btn-camera" id="cameraBtn" onclick="toggleCamera()">📷 Start Camera</button>
-            <button onclick="switchCamera()">🔄 Switch</button>
-        </div>
+        <button class="emergency-btn" onclick="sendEmergency()">🚨 EMERGENCY BUTTON 🚨</button>
         
-        <button class="emergency-btn" onclick="sendEmergency()">🚨 EMERGENCY</button>
-        
-        <div class="stats-grid">
-            <div class="stat-card">
-                <div class="stat-value" id="personCount">0</div>
-                <div class="stat-label">👤 Persons</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="vehicleCount">0</div>
-                <div class="stat-label">🚗 Vehicles</div>
-            </div>
-            <div class="stat-card">
-                <div class="stat-value" id="fpsValue">0</div>
-                <div class="stat-label">📊 FPS</div>
+        <div class="card">
+            <div class="stats">
+                <div class="stat">
+                    <div class="stat-value" id="personCount">0</div>
+                    <div class="stat-label">Persons</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="vehicleCount">0</div>
+                    <div class="stat-label">Vehicles</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value" id="fpsValue">0</div>
+                    <div class="stat-label">FPS</div>
+                </div>
             </div>
         </div>
         
-        <div class="detection-list" id="detectionList">
-            <div style="text-align:center; opacity:0.5; padding:10px; font-size:13px;">🔍 Looking for objects...</div>
+        <div class="card">
+            <h3>👤 Detected Objects</h3>
+            <div id="detectionList" class="detection-list">No detections yet...</div>
         </div>
         
-        <div class="location-card">
-            <div class="label">📍 Current Location</div>
-            <div class="address" id="addressText">Getting location...</div>
-            <div class="coords" id="coordsText">11.2745°N, 77.5831°E</div>
-            <button onclick="openGoogleMaps()">🗺️ Open Google Maps</button>
+        <div class="card">
+            <h3>🔔 Alerts</h3>
+            <div id="alertList" class="alert-list"></div>
         </div>
         
-        <div class="debug-info" id="debugInfo">Model: Loading... | Frames: 0 | Detections: 0</div>
+        <div class="card">
+            <h3>📍 EXACT Location</h3>
+            <div id="locationInfo" class="location">
+                <div id="locationAddress">Getting exact location...</div>
+                <div class="coords" id="coordsText">--</div>
+                <div class="accuracy" id="accuracyText">Accuracy: --</div>
+                <div id="locationSource" style="font-size:10px;opacity:0.6;">Source: --</div>
+            </div>
+            <div id="map"></div>
+            <button class="map-btn" onclick="openGoogleMaps()">🗺️ Open in Google Maps</button>
+            <div class="device-info" id="deviceInfo">Device: Loading...</div>
+        </div>
+        
+        <!-- ============================================ -->
+        <!-- CONNECTION LINKS SECTION - At the Bottom -->
+        <!-- ============================================ -->
+        <div class="connection-section">
+            <h3>🔗 Share This Device</h3>
+            
+            <div class="connection-link">
+                <div class="label">📱 Open on Other Mobile / Laptop</div>
+                <div class="url" id="connectionUrl" onclick="copyToClipboard('connectionUrl')">Loading URL...</div>
+                <button class="copy-btn" onclick="copyToClipboard('connectionUrl')">📋 Copy Link</button>
+            </div>
+            
+            <div class="connection-link">
+                <div class="label">🖥️ Local IP Address</div>
+                <div class="url" id="localIp" onclick="copyToClipboard('localIp')">Detecting...</div>
+                <button class="copy-btn" onclick="copyToClipboard('localIp')">📋 Copy IP</button>
+            </div>
+            
+            <div class="connection-link">
+                <div class="label">📱 Device ID</div>
+                <div class="url" id="deviceIdDisplay" style="font-size:12px;color:#ffc107;">Loading...</div>
+            </div>
+            
+            <div class="qr-container">
+                <div id="qrCodeContainer">
+                    <p style="font-size:11px;opacity:0.5;">Scan to connect</p>
+                    <img id="qrCodeImage" src="" alt="QR Code" style="display:none;">
+                    <div id="qrLoading" style="padding:20px;font-size:12px;opacity:0.5;">Loading QR Code...</div>
+                </div>
+            </div>
+            
+            <div class="connected-devices">
+                <div class="label" style="font-size:10px;opacity:0.5;margin-bottom:5px;">📱 Connected Devices:</div>
+                <div id="connectedDevicesList">
+                    <div style="font-size:11px;opacity:0.4;">No devices connected</div>
+                </div>
+            </div>
+            
+            <div class="device-id-display" id="deviceIdFull">Device ID: --</div>
+        </div>
     </div>
     
     <script>
-        // ============================================
-        // CONFIGURATION
-        // ============================================
-        let video = document.getElementById('video');
-        let stream = null;
-        let isCameraOn = false;
-        let facingMode = 'environment';
-        let captureInterval = null;
-        let lastFrameTime = Date.now();
-        let frameCount = 0;
-        let retryCount = 0;
-        const MAX_RETRIES = 3;
-        let isInitialized = false;
+        let ws = null;
+        let map = null;
+        let marker = null;
+        let currentLocation = { lat: 0, lng: 0 };
+        let geocoder = null;
+        let locationWatchId = null;
+        let deviceInfo = {};
+        let connectedDevices = [];
         
-        // ============================================
-        // COPY URL
-        // ============================================
-        function copyUrl(elementId) {
-            const element = document.getElementById(elementId);
-            const text = element.textContent;
-            if (text && text !== 'Loading...' && text !== '') {
-                navigator.clipboard.writeText(text).then(() => {
-                    const btn = element.parentElement.querySelector('.copy-btn');
-                    const originalText = btn.textContent;
-                    btn.textContent = '✅ Copied!';
-                    setTimeout(() => { btn.textContent = originalText; }, 2000);
-                }).catch(() => {
-                    const textArea = document.createElement('textarea');
-                    textArea.value = text;
-                    document.body.appendChild(textArea);
-                    textArea.select();
-                    document.execCommand('copy');
-                    document.body.removeChild(textArea);
-                    alert('URL copied to clipboard!');
-                });
-            } else {
-                alert('Please wait for URL to load...');
+        function initMap() {
+            const center = { lat: currentLocation.lat || 11.2745, lng: currentLocation.lng || 77.5831 };
+            map = new google.maps.Map(document.getElementById('map'), {
+                zoom: 18,
+                center: center,
+                styles: [
+                    { featureType: 'all', elementType: 'all', stylers: [{ saturation: -80 }, { lightness: 20 }] }
+                ]
+            });
+            
+            marker = new google.maps.Marker({
+                position: center,
+                map: map,
+                title: 'Current Location',
+                icon: {
+                    url: 'https://maps.google.com/mapfiles/ms/icons/red-dot.png',
+                    scaledSize: new google.maps.Size(40, 40)
+                }
+            });
+            
+            const circle = new google.maps.Circle({
+                map: map,
+                radius: 50,
+                fillColor: '#2196f3',
+                fillOpacity: 0.15,
+                strokeColor: '#2196f3',
+                strokeOpacity: 0.3,
+                strokeWeight: 1
+            });
+            circle.bindTo('center', marker, 'position');
+            
+            geocoder = new google.maps.Geocoder();
+        }
+        
+        function updateLocationOnMap(lat, lng, accuracy) {
+            const pos = { lat: lat, lng: lng };
+            if (marker) {
+                marker.setPosition(pos);
+                map.setCenter(pos);
+                map.setZoom(18);
+            }
+            if (accuracy !== undefined && accuracy !== null) {
+                document.getElementById('accuracyText').textContent = `Accuracy: ${accuracy}m`;
             }
         }
         
-        // ============================================
-        // UPDATE LINKS - IMMEDIATELY
-        // ============================================
-        function updateLinks() {
-            const currentUrl = window.location.href;
-            document.getElementById('mainUrl').textContent = currentUrl;
-            
-            fetch('/test')
-                .then(res => res.json())
-                .then(data => {
-                    document.getElementById('deviceInfo').textContent = 
-                        `Device ID: ${data.device_id || 'Unknown'} | Model: ${data.model_loaded ? '✅' : '❌'}`;
-                    if (data.model_loaded) {
-                        document.getElementById('modelStatus').textContent = '🤖 Active';
-                        document.getElementById('modelStatus').className = 'badge badge-success';
-                    }
-                })
-                .catch(() => {
-                    document.getElementById('deviceInfo').textContent = 'Device ID: Connected';
-                });
-        }
-        
-        // ============================================
-        // CAMERA - With Retry Logic
-        // ============================================
-        async function startCamera() {
-            try {
-                document.getElementById('cameraStatus').textContent = '📷 Starting...';
-                document.getElementById('cameraStatus').className = 'badge badge-warning';
-                
-                const constraints = {
-                    video: {
-                        facingMode: facingMode,
-                        width: { ideal: 480 },
-                        height: { ideal: 360 }
-                    },
-                    audio: false
+        function startTracking() {
+            if (navigator.geolocation) {
+                const options = {
+                    enableHighAccuracy: true,
+                    timeout: 10000,
+                    maximumAge: 0
                 };
                 
-                stream = await navigator.mediaDevices.getUserMedia(constraints);
-                video.srcObject = stream;
-                await video.play();
-                
-                isCameraOn = true;
-                retryCount = 0;
-                document.getElementById('videoPlaceholder').classList.add('hidden');
-                document.getElementById('cameraBtn').textContent = '⏹️ Stop Camera';
-                document.getElementById('cameraBtn').classList.add('active');
-                document.getElementById('cameraStatus').textContent = '📷 Active';
-                document.getElementById('cameraStatus').className = 'badge badge-success';
-                
-                startFrameCapture();
-                console.log('📷 Camera started');
-                
-            } catch(err) {
-                console.error('Camera error:', err);
-                document.getElementById('cameraStatus').textContent = '❌ Error';
-                document.getElementById('cameraStatus').className = 'badge badge-danger';
-                
-                if (retryCount < MAX_RETRIES) {
-                    retryCount++;
-                    console.log(`Retrying camera (${retryCount}/${MAX_RETRIES})...`);
-                    setTimeout(startCamera, 2000);
-                } else {
-                    alert('Camera access denied. Please:\n1. Use HTTPS (Render URL)\n2. Allow camera permissions\n3. Try Chrome browser');
-                    document.getElementById('cameraStatus').textContent = '📷 Click Start';
-                    document.getElementById('cameraStatus').className = 'badge badge-warning';
-                }
-            }
-        }
-        
-        function stopCamera() {
-            if (stream) {
-                stream.getTracks().forEach(track => track.stop());
-                stream = null;
-            }
-            video.srcObject = null;
-            isCameraOn = false;
-            
-            if (captureInterval) {
-                clearInterval(captureInterval);
-                captureInterval = null;
-            }
-            
-            document.getElementById('videoPlaceholder').classList.remove('hidden');
-            document.getElementById('cameraBtn').textContent = '📷 Start Camera';
-            document.getElementById('cameraBtn').classList.remove('active');
-            document.getElementById('cameraStatus').textContent = '📷 Stopped';
-            document.getElementById('cameraStatus').className = 'badge badge-warning';
-        }
-        
-        function toggleCamera() {
-            if (isCameraOn) {
-                stopCamera();
-            } else {
-                startCamera();
-            }
-        }
-        
-        function switchCamera() {
-            facingMode = (facingMode === 'environment') ? 'user' : 'environment';
-            if (isCameraOn) {
-                stopCamera();
-                setTimeout(startCamera, 500);
-            }
-        }
-        
-        // ============================================
-        // FRAME CAPTURE
-        // ============================================
-        function startFrameCapture() {
-            if (captureInterval) clearInterval(captureInterval);
-            
-            const canvas = document.createElement('canvas');
-            canvas.width = 480;
-            canvas.height = 360;
-            const ctx = canvas.getContext('2d');
-            
-            captureInterval = setInterval(() => {
-                if (!isCameraOn || video.readyState !== video.HAVE_ENOUGH_DATA) {
-                    return;
-                }
-                
-                try {
-                    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                    const imageData = canvas.toDataURL('image/jpeg', 0.8);
-                    
-                    fetch('/process_frame', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ image: imageData })
-                    })
-                    .then(res => res.json())
-                    .then(data => {
-                        updateUI(data);
-                        if (data.debug) {
-                            document.getElementById('debugInfo').textContent = 
-                                `Model: ${data.debug.model_loaded ? '✅ Loaded' : '❌ Not Loaded'} | ` +
-                                `Frames: ${data.debug.frames_processed} | ` +
-                                `Detections: ${data.debug.total_detections_found}`;
+                locationWatchId = navigator.geolocation.watchPosition(
+                    (position) => {
+                        const lat = position.coords.latitude;
+                        const lng = position.coords.longitude;
+                        const accuracy = position.coords.accuracy || 0;
+                        const altitude = position.coords.altitude || 0;
+                        const speed = position.coords.speed || 0;
+                        const heading = position.coords.heading || 0;
+                        
+                        currentLocation = { lat, lng, accuracy };
+                        
+                        document.getElementById('coordsText').textContent = 
+                            `${lat.toFixed(6)}°N, ${lng.toFixed(6)}°E`;
+                        document.getElementById('accuracyText').textContent = 
+                            `Accuracy: ${accuracy.toFixed(0)}m | Speed: ${(speed * 3.6).toFixed(1)} km/h`;
+                        
+                        // Show source
+                        const source = accuracy < 20 ? 'GPS (High Accuracy)' : accuracy < 100 ? 'GPS' : 'WiFi/Network';
+                        document.getElementById('locationSource').textContent = `Source: ${source}`;
+                        
+                        // Accuracy badge
+                        const badge = document.getElementById('accuracyBadge') || document.createElement('span');
+                        badge.id = 'accuracyBadge';
+                        badge.className = `accuracy-badge ${accuracy < 20 ? 'accuracy-high' : accuracy < 100 ? 'accuracy-medium' : 'accuracy-low'}`;
+                        badge.textContent = accuracy < 20 ? '🟢 High Accuracy' : accuracy < 100 ? '🟡 Medium Accuracy' : '🔴 Low Accuracy';
+                        document.getElementById('accuracyText').appendChild(badge);
+                        
+                        updateLocationOnMap(lat, lng, accuracy);
+                        
+                        if (geocoder) {
+                            geocoder.geocode({ location: { lat, lng } }, (results, status) => {
+                                let address = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+                                if (status === 'OK' && results[0]) {
+                                    address = results[0].formatted_address;
+                                    document.getElementById('locationAddress').textContent = address;
+                                }
+                                sendLocationUpdate(lat, lng, address, accuracy, altitude, speed, heading);
+                            });
+                        } else {
+                            sendLocationUpdate(lat, lng, `${lat.toFixed(6)}, ${lng.toFixed(6)}`, accuracy, altitude, speed, heading);
                         }
-                    })
-                    .catch(err => console.error('Send error:', err));
-                    
-                    frameCount++;
-                    const now = Date.now();
-                    if (now - lastFrameTime >= 1000) {
-                        document.getElementById('fpsOverlay').textContent = frameCount;
-                        frameCount = 0;
-                        lastFrameTime = now;
-                    }
-                    
-                } catch(e) {
-                    console.error('Frame capture error:', e);
-                }
-            }, 200);
-            
-            console.log('📷 Frame capture started');
-        }
-        
-        // ============================================
-        // GPS
-        // ============================================
-        let watchId = null;
-        let currentLocation = { lat: 11.2745, lng: 77.5831 };
-        
-        function startGPS() {
-            if (!navigator.geolocation) {
-                document.getElementById('gpsStatus').textContent = '❌ Not Supported';
-                document.getElementById('gpsStatus').className = 'badge badge-danger';
-                return;
+                    },
+                    (error) => {
+                        console.error("GPS Tracking error:", error);
+                        document.getElementById('coordsText').textContent = '⚠️ GPS Error - Using WiFi fallback';
+                        document.getElementById('locationSource').textContent = 'Source: WiFi/Network (Fallback)';
+                        getLocationFromIP();
+                    },
+                    options
+                );
+            } else {
+                document.getElementById('coordsText').textContent = '❌ GPS Not Supported';
+                getLocationFromIP();
             }
-            
-            document.getElementById('gpsStatus').textContent = '📍 Getting...';
-            document.getElementById('gpsStatus').className = 'badge badge-warning';
-            
-            watchId = navigator.geolocation.watchPosition(
-                (position) => {
-                    const lat = position.coords.latitude;
-                    const lng = position.coords.longitude;
-                    currentLocation = { lat, lng };
-                    
-                    document.getElementById('coordsText').textContent = 
-                        `${lat.toFixed(6)}°N, ${lng.toFixed(6)}°E`;
-                    document.getElementById('gpsStatus').textContent = '📍 Active';
-                    document.getElementById('gpsStatus').className = 'badge badge-success';
-                    
-                    fetch('/location', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ lat, lng })
-                    }).catch(() => {});
-                    
-                    reverseGeocode(lat, lng);
-                },
-                (error) => {
-                    console.error('GPS Error:', error);
-                    document.getElementById('gpsStatus').textContent = '📍 Fallback';
-                    document.getElementById('gpsStatus').className = 'badge badge-warning';
-                    document.getElementById('coordsText').textContent = '11.2745°N, 77.5831°E';
-                },
-                { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
-            );
         }
         
-        function reverseGeocode(lat, lng) {
-            const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lng}&zoom=18&addressdetails=1`;
-            fetch(url)
+        function getLocationFromIP() {
+            fetch('https://ipapi.co/json/')
                 .then(res => res.json())
                 .then(data => {
-                    if (data && data.display_name) {
-                        document.getElementById('addressText').textContent = data.display_name;
+                    if (data.latitude && data.longitude) {
+                        const lat = parseFloat(data.latitude);
+                        const lng = parseFloat(data.longitude);
+                        const address = `${data.city || ''}, ${data.region || ''}, ${data.country_name || ''}`;
+                        document.getElementById('locationAddress').textContent = address || 'WiFi Location';
+                        document.getElementById('coordsText').textContent = 
+                            `${lat.toFixed(6)}°N, ${lng.toFixed(6)}°E (WiFi)`;
+                        document.getElementById('accuracyText').textContent = 'Accuracy: ~1000m (Network)';
+                        document.getElementById('locationSource').textContent = 'Source: WiFi/Network';
+                        updateLocationOnMap(lat, lng, 1000);
+                        sendLocationUpdate(lat, lng, address, 1000, 0, 0, 0);
                     }
                 })
                 .catch(() => {
-                    document.getElementById('addressText').textContent = `${lat.toFixed(6)}, ${lng.toFixed(6)}`;
+                    console.log('IP location fallback failed');
                 });
         }
         
-        function openGoogleMaps() {
-            const url = `https://www.google.com/maps?q=${currentLocation.lat},${currentLocation.lng}`;
-            window.open(url, '_blank');
+        function sendLocationUpdate(lat, lng, address, accuracy, altitude, speed, heading) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'location_update',
+                    lat: lat,
+                    lng: lng,
+                    address: address,
+                    accuracy: accuracy || 0,
+                    altitude: altitude || 0,
+                    speed: speed || 0,
+                    heading: heading || 0
+                }));
+            }
         }
         
-        // ============================================
-        // UI UPDATE
-        // ============================================
+        function connectWebSocket() {
+            const wsUrl = `ws://${window.location.hostname}:8765`;
+            console.log('Connecting to:', wsUrl);
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+                document.getElementById('wsStatus').innerHTML = '🟢 Connected';
+                document.getElementById('wsStatus').className = 'badge connected';
+                ws.send(JSON.stringify({ type: 'register' }));
+                addAlert('System', 'Connected to server');
+                startTracking();
+                updateConnectionInfo();
+            };
+            
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    updateUI(data);
+                } catch(e) {
+                    console.error('Parse error:', e);
+                }
+            };
+            
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                document.getElementById('wsStatus').innerHTML = '🔴 Disconnected';
+                document.getElementById('wsStatus').className = 'badge disconnected';
+                setTimeout(connectWebSocket, 3000);
+            };
+        }
+        
         function updateUI(data) {
-            if (!data) return;
-            
-            document.getElementById('serverStatus').textContent = '🌐 Connected';
-            document.getElementById('serverStatus').className = 'badge badge-success';
-            
             if (data.person_count !== undefined) {
-                document.getElementById('personCount').textContent = data.person_count;
-                document.getElementById('detectionOverlay').textContent = `👤 ${data.person_count} | 🚗 ${data.vehicle_count || 0}`;
+                document.getElementById('personCount').innerText = data.person_count;
             }
             if (data.vehicle_count !== undefined) {
-                document.getElementById('vehicleCount').textContent = data.vehicle_count;
+                document.getElementById('vehicleCount').innerText = data.vehicle_count;
             }
-            if (data.fps !== undefined && data.fps > 0) {
-                document.getElementById('fpsValue').textContent = data.fps;
+            if (data.fps !== undefined) {
+                document.getElementById('fpsValue').innerText = data.fps;
             }
             
+            if (data.arduino_connected !== undefined) {
+                const arduinoStatus = document.getElementById('arduinoStatus');
+                if (data.arduino_connected) {
+                    arduinoStatus.innerHTML = '🔌 Arduino: ✅ Connected';
+                    arduinoStatus.className = 'badge connected';
+                } else {
+                    arduinoStatus.innerHTML = '🔌 Arduino: ⚠️ Software Mode';
+                    arduinoStatus.className = 'badge warning';
+                }
+            }
+            
+            if (data.device_id) {
+                deviceInfo = data;
+                document.getElementById('deviceInfo').textContent = 
+                    `Device: ${data.device_name || data.device_id.substring(0, 8)} | IP: ${data.ip_address || '--'}`;
+                document.getElementById('deviceIdFull').textContent = `Device ID: ${data.device_id}`;
+                document.getElementById('deviceIdDisplay').textContent = data.device_id;
+                
+                const hostname = window.location.hostname;
+                const port = window.location.port || '5000';
+                const url = `http://${hostname}:${port}`;
+                document.getElementById('connectionUrl').textContent = url;
+                document.getElementById('localIp').textContent = data.ip_address || hostname;
+                generateQRCode(url);
+            }
+            
+            if (data.connected_clients !== undefined) {
+                const deviceList = document.getElementById('connectedDevicesList');
+                if (data.connected_clients > 0) {
+                    deviceList.innerHTML = `<div class="device-item">🟢 ${data.connected_clients} device(s) connected</div>`;
+                } else {
+                    deviceList.innerHTML = '<div style="font-size:11px;opacity:0.4;">No devices connected</div>';
+                }
+            }
+            
+            fetch('/stats')
+                .then(res => res.json())
+                .then(stats => {
+                    const dbStatus = document.getElementById('dbStatus');
+                    if (stats.mongodb_connected) {
+                        dbStatus.innerHTML = '📊 DB: ✅ Connected';
+                        dbStatus.className = 'badge connected';
+                    } else {
+                        dbStatus.innerHTML = '📊 DB: ❌ Disconnected';
+                        dbStatus.className = 'badge disconnected';
+                    }
+                })
+                .catch(() => {});
+            
             if (data.detections && data.detections.length > 0) {
-                let html = '';
-                data.detections.forEach(d => {
-                    const emoji = d.class === 'person' ? '👤' : 
-                                  (d.class.includes('car') || d.class.includes('vehicle') ? '🚗' : 
-                                  (d.class === 'bicycle' ? '🚲' : '📦'));
-                    const distanceClass = `distance-${d.distance.replace(' ', '-')}`;
-                    html += `<div class="detection-item">
-                        <span><span class="emoji">${emoji}</span> ${d.class}</span>
-                        <span>
-                            <span class="${distanceClass}">${d.distance}</span>
-                            <span class="conf">${Math.round(d.confidence * 100)}%</span>
-                        </span>
-                    </div>`;
-                });
-                document.getElementById('detectionList').innerHTML = html;
-            } else {
-                document.getElementById('detectionList').innerHTML = 
-                    '<div style="text-align:center; opacity:0.5; padding:10px; font-size:13px;">🔍 Looking for objects...</div>';
+                updateDetections(data.detections);
             }
             
             if (data.location) {
-                document.getElementById('coordsText').textContent = 
-                    `${data.location.lat.toFixed(6)}°N, ${data.location.lng.toFixed(6)}°E`;
-                if (data.location.address) {
-                    document.getElementById('addressText').textContent = data.location.address;
+                const lat = data.location.lat;
+                const lng = data.location.lng;
+                const address = data.location.address || 'Unknown location';
+                const accuracy = data.location.accuracy || '--';
+                const source = data.location.source || 'unknown';
+                
+                if (lat && lng && lat !== 0 && lng !== 0) {
+                    document.getElementById('locationAddress').textContent = address;
+                    document.getElementById('coordsText').textContent = 
+                        `${lat.toFixed(6)}°N, ${lng.toFixed(6)}°E`;
+                    document.getElementById('accuracyText').textContent = 
+                        `Accuracy: ${accuracy}m`;
+                    document.getElementById('locationSource').textContent = `Source: ${source}`;
+                    updateLocationOnMap(lat, lng, accuracy);
                 }
             }
-        }
-        
-        // ============================================
-        // EMERGENCY
-        // ============================================
-        async function sendEmergency() {
-            if (!confirm('🚨 Send emergency alert with your location?')) return;
             
-            try {
-                document.querySelector('.emergency-btn').textContent = '🚨 SENDING...';
-                document.querySelector('.emergency-btn').disabled = true;
-                
-                const response = await fetch('/emergency', { method: 'POST' });
-                const data = await response.json();
-                
-                if (data.status === 'success') {
-                    alert('🚨 Emergency alert sent successfully!');
-                    if (navigator.vibrate) navigator.vibrate([500, 300, 500]);
-                    setTimeout(() => {
-                        if (confirm('🚨 Open Google Maps for location?')) {
-                            openGoogleMaps();
-                        }
-                    }, 1000);
-                }
-            } catch(e) {
-                console.error('Emergency error:', e);
-                alert('Network error sending emergency');
-            } finally {
-                document.querySelector('.emergency-btn').textContent = '🚨 EMERGENCY';
-                document.querySelector('.emergency-btn').disabled = false;
+            if (data.type === 'emergency') {
+                handleEmergency(data);
             }
         }
         
-        // ============================================
-        // POLL SERVER
-        // ============================================
-        function pollServer() {
+        function updateConnectionInfo() {
             fetch('/stats')
                 .then(res => res.json())
                 .then(data => {
-                    if (data.person_count !== undefined) {
-                        document.getElementById('personCount').textContent = data.person_count;
-                        document.getElementById('detectionOverlay').textContent = `👤 ${data.person_count} | 🚗 ${data.vehicle_count || 0}`;
+                    if (data.device_id) {
+                        document.getElementById('deviceIdFull').textContent = `Device ID: ${data.device_id}`;
+                        document.getElementById('deviceIdDisplay').textContent = data.device_id;
                     }
-                    if (data.vehicle_count !== undefined) {
-                        document.getElementById('vehicleCount').textContent = data.vehicle_count;
-                    }
-                    if (data.fps !== undefined && data.fps > 0) {
-                        document.getElementById('fpsValue').textContent = data.fps;
+                    if (data.ip_address) {
+                        document.getElementById('localIp').textContent = data.ip_address;
                     }
                     
-                    if (data.debug) {
-                        document.getElementById('debugInfo').textContent = 
-                            `Model: ${data.debug.model_loaded ? '✅ Loaded' : '❌ Not Loaded'} | ` +
-                            `Frames: ${data.debug.frames_processed} | ` +
-                            `Detections: ${data.debug.total_detections_found}`;
-                    }
+                    const hostname = window.location.hostname;
+                    const port = window.location.port || '5000';
+                    const url = `http://${hostname}:${port}`;
+                    document.getElementById('connectionUrl').textContent = url;
+                    generateQRCode(url);
                 })
                 .catch(() => {});
         }
         
-        // ============================================
-        // INITIALIZATION
-        // ============================================
-        function init() {
-            if (isInitialized) return;
-            isInitialized = true;
+        function generateQRCode(url) {
+            const qrImg = document.getElementById('qrCodeImage');
+            const qrLoading = document.getElementById('qrLoading');
             
-            // Update links immediately
-            setTimeout(updateLinks, 500);
-            
-            // Start GPS
-            setTimeout(startGPS, 1000);
-            
-            // Don't auto-start camera - let user click
-            document.getElementById('cameraStatus').textContent = '📷 Click Start';
-            document.getElementById('cameraStatus').className = 'badge badge-warning';
-            
-            // Poll server every 2 seconds
-            setInterval(pollServer, 2000);
-            
-            // Update links periodically
-            setInterval(updateLinks, 10000);
-            
-            console.log('✅ System initialized');
-            console.log('📱 Open on mobile:', window.location.href);
+            const qrUrl = `https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=${encodeURIComponent(url)}`;
+            qrImg.src = qrUrl;
+            qrImg.onload = () => {
+                qrImg.style.display = 'inline';
+                qrLoading.style.display = 'none';
+            };
+            qrImg.onerror = () => {
+                qrLoading.textContent = '📱 Scan with QR reader';
+                qrLoading.style.display = 'block';
+            };
         }
         
-        // Start when page loads
-        document.addEventListener('DOMContentLoaded', init);
+        function copyToClipboard(elementId) {
+            const element = document.getElementById(elementId);
+            const text = element.textContent;
+            if (navigator.clipboard) {
+                navigator.clipboard.writeText(text).then(() => {
+                    const btn = element.parentElement.querySelector('.copy-btn');
+                    const originalText = btn.textContent;
+                    btn.textContent = '✅ Copied!';
+                    setTimeout(() => btn.textContent = originalText, 2000);
+                }).catch(() => {
+                    copyTextFallback(text);
+                });
+            } else {
+                copyTextFallback(text);
+            }
+        }
         
-        // Also try on load
-        window.addEventListener('load', function() {
-            setTimeout(updateLinks, 100);
-        });
+        function copyTextFallback(text) {
+            const input = document.createElement('input');
+            input.value = text;
+            document.body.appendChild(input);
+            input.select();
+            document.execCommand('copy');
+            document.body.removeChild(input);
+            alert('📋 Copied: ' + text);
+        }
+        
+        function updateDetections(detections) {
+            const container = document.getElementById('detectionList');
+            if (!detections || detections.length === 0) {
+                container.innerHTML = '<div style="text-align:center;padding:20px;opacity:0.5;">No objects detected</div>';
+                return;
+            }
+            
+            let html = '';
+            detections.slice(0, 10).forEach(obj => {
+                const isDanger = obj.distance === 'very close';
+                const isWarning = obj.distance === 'close';
+                const dangerClass = isDanger ? 'detection-danger' : (isWarning ? 'detection-warning' : '');
+                const emoji = obj.class === 'person' ? '👤' : (obj.class.includes('car') ? '🚗' : '📦');
+                
+                html += `<div class="detection-item ${dangerClass}">
+                    <div>
+                        <strong>${emoji} ${obj.class}</strong><br>
+                        <small>${obj.direction} • ${obj.distance}</small>
+                    </div>
+                    <div>${Math.round(obj.confidence * 100)}%</div>
+                </div>`;
+            });
+            container.innerHTML = html;
+        }
+        
+        function handleEmergency(data) {
+            addAlert(data.title || 'EMERGENCY', data.message || 'Emergency alert!', true);
+            
+            if (navigator.vibrate) {
+                navigator.vibrate([500, 300, 500]);
+            }
+            
+            if (data.maps_url) {
+                setTimeout(() => {
+                    if (confirm('🚨 EMERGENCY ALERT! Open Google Maps for location?')) {
+                        window.open(data.maps_url, '_blank');
+                    }
+                }, 1000);
+            }
+        }
+        
+        async function sendEmergency() {
+            if (confirm('⚠️ Send EMERGENCY alert?')) {
+                try {
+                    const response = await fetch('/emergency', { method: 'POST' });
+                    const data = await response.json();
+                    if (data.status === 'success') {
+                        addAlert('EMERGENCY SENT', 'Emergency alert has been sent!', true);
+                        if (navigator.vibrate) navigator.vibrate([500, 500, 500]);
+                        if (data.maps_url) {
+                            setTimeout(() => window.open(data.maps_url, '_blank'), 2000);
+                        }
+                    }
+                } catch(e) {
+                    console.error('Emergency error:', e);
+                    addAlert('Error', 'Failed to send emergency alert');
+                }
+            }
+        }
+        
+        function openGoogleMaps() {
+            fetch('/stats')
+                .then(res => res.json())
+                .then(data => {
+                    if (data.location && data.location.lat && data.location.lng) {
+                        const url = `https://www.google.com/maps?q=${data.location.lat},${data.location.lng}`;
+                        window.open(url, '_blank');
+                    } else {
+                        alert('Location not available yet');
+                    }
+                })
+                .catch(() => alert('Could not get location'));
+        }
+        
+        function addAlert(title, message, isEmergency = false) {
+            const container = document.getElementById('alertList');
+            const time = new Date().toLocaleTimeString();
+            const div = document.createElement('div');
+            div.className = `alert-item ${isEmergency ? 'alert-emergency' : ''}`;
+            div.innerHTML = `<div style="font-size:10px;opacity:0.5;">${time}</div>
+                            <div style="font-weight:bold;">${title}</div>
+                            <div style="font-size:12px;">${message}</div>`;
+            container.insertBefore(div, container.firstChild);
+            while (container.children.length > 20) container.removeChild(container.lastChild);
+        }
+        
+        // Initialize
+        connectWebSocket();
+        
+        setTimeout(() => {
+            addAlert('System', 'Smart Blind Stick ready!');
+            updateConnectionInfo();
+        }, 1000);
+        
+        setInterval(() => {
+            fetch('/stats').then(res => res.json()).then(data => {
+                if (data.person_count !== undefined) {
+                    document.getElementById('personCount').innerText = data.person_count;
+                    document.getElementById('vehicleCount').innerText = data.vehicle_count;
+                    document.getElementById('fpsValue').innerText = data.fps;
+                }
+                if (data.connected_clients !== undefined) {
+                    const deviceList = document.getElementById('connectedDevicesList');
+                    if (data.connected_clients > 0) {
+                        deviceList.innerHTML = `<div class="device-item">🟢 ${data.connected_clients} device(s) connected</div>`;
+                    } else {
+                        deviceList.innerHTML = '<div style="font-size:11px;opacity:0.4;">No devices connected</div>';
+                    }
+                }
+            }).catch(e => console.log(e));
+        }, 2000);
         
         window.addEventListener('beforeunload', () => {
-            if (captureInterval) clearInterval(captureInterval);
-            if (watchId) navigator.geolocation.clearWatch(watchId);
-            if (stream) {
-                stream.getTracks().forEach(track => track.stop());
+            if (locationWatchId) {
+                navigator.geolocation.clearWatch(locationWatchId);
             }
         });
     </script>
+    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyCdQGVYnjmSAzxnTu4g_zEXKGhgzqbZDvc&callback=initMap" async defer></script>
 </body>
 </html>
 '''
-
-# ============================================
-# FLASK ROUTES
-# ============================================
 
 blind_stick = None
 
@@ -1079,127 +1706,107 @@ blind_stick = None
 def index():
     return render_template_string(HTML_TEMPLATE)
 
+@app.route('/video_feed')
+def video_feed():
+    if blind_stick:
+        return Response(blind_stick.generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return "Camera not initialized", 500
+
 @app.route('/stats')
 def stats():
     if blind_stick:
-        return jsonify(blind_stick.get_current_data())
-    return jsonify({'person_count': 0, 'vehicle_count': 0, 'fps': 0})
-
-@app.route('/devices')
-def get_devices():
-    if blind_stick:
-        return jsonify({'devices': device_views})
-    return jsonify({'devices': {}})
-
-@app.route('/view/<device_id>')
-def view_device(device_id):
-    if device_id in device_views:
-        return jsonify(device_views[device_id])
-    return jsonify({'error': 'Device not found'}), 404
-
-@app.route('/process_frame', methods=['POST'])
-def process_frame():
-    if not blind_stick:
-        return jsonify({'error': 'System not ready'}), 503
-    
-    try:
-        data = request.json
-        image_data = data.get('image', '')
-        
-        if image_data and ',' in image_data:
-            image_data = image_data.split(',')[1]
-            if blind_stick.frame_queue.qsize() < 10:
-                blind_stick.frame_queue.put(image_data)
-        
-        return jsonify(blind_stick.get_current_data())
-        
-    except Exception as e:
-        print(f"Frame processing error: {e}")
-        return jsonify({'error': str(e)}), 500
+        return jsonify({
+            'connected_clients': len(blind_stick.clients),
+            'person_count': blind_stick.person_count,
+            'vehicle_count': blind_stick.vehicle_count,
+            'fps': blind_stick.fps,
+            'emergency': blind_stick.emergency_mode,
+            'location': blind_stick.current_location,
+            'arduino_connected': blind_stick.arduino.connected,
+            'mongodb_connected': db is not None,
+            'device_id': blind_stick.device_id,
+            'device_name': blind_stick.device_name,
+            'ip_address': blind_stick.local_ip,
+            'location_updates': blind_stick.location_update_count
+        })
+    return jsonify({'connected_clients': 0, 'person_count': 0, 'fps': 0})
 
 @app.route('/emergency', methods=['POST'])
 def emergency():
     if blind_stick:
         blind_stick.emergency_mode = True
+        blind_stick.speak("EMERGENCY! Help needed immediately!", "emergency")
         
-        print(f"\n{'='*60}")
-        print("🚨 EMERGENCY ALERT!")
-        print(f"📍 Location: {blind_stick.current_location['address']}")
-        print(f"📍 Coords: {blind_stick.current_location['lat']}, {blind_stick.current_location['lng']}")
-        print(f"👥 Persons: {blind_stick.person_count}")
-        print(f"{'='*60}\n")
+        async def send():
+            await blind_stick.send_emergency(blind_stick.current_location, blind_stick.person_count)
         
-        def reset_emergency():
+        if hasattr(blind_stick, 'ws_loop'):
+            asyncio.run_coroutine_threadsafe(send(), blind_stick.ws_loop)
+        else:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(send())
+        
+        def reset():
             time.sleep(30)
             blind_stick.emergency_mode = False
+        threading.Thread(target=reset, daemon=True).start()
         
-        threading.Thread(target=reset_emergency, daemon=True).start()
-        
-        return jsonify({'status': 'success'})
-    
+        maps_url = f"https://www.google.com/maps?q={blind_stick.current_location['lat']},{blind_stick.current_location['lng']}"
+        return jsonify({'status': 'success', 'maps_url': maps_url})
     return jsonify({'status': 'error'}), 500
 
-@app.route('/location', methods=['POST'])
-def update_location():
-    if blind_stick:
-        try:
-            data = request.json
-            lat = data.get('lat')
-            lng = data.get('lng')
-            
-            if lat is not None and lng is not None:
-                blind_stick.current_location = {
-                    "lat": lat,
-                    "lng": lng,
-                    "address": f"{lat:.6f}, {lng:.6f}"
-                }
-                return jsonify({'status': 'success'})
-        except Exception as e:
-            print(f"Location error: {e}")
-    return jsonify({'status': 'error'}), 500
-
-@app.route('/test')
-def test():
-    return jsonify({
-        'status': 'running',
-        'is_render': IS_RENDER,
-        'local_ip': blind_stick.local_ip if blind_stick else '127.0.0.1',
-        'port': PORT,
-        'model_loaded': blind_stick.model_loaded if blind_stick else False,
-        'device_id': blind_stick.device_id if blind_stick else 'Unknown',
-        'timestamp': datetime.now().isoformat()
-    })
-
-# ============================================
-# MAIN
-# ============================================
+@app.route('/api/location/history')
+def get_location_history():
+    if db is None:
+        return jsonify({'success': False, 'error': 'Database not connected'}), 503
+    try:
+        history = list(db.location_tracking.find(
+            {"device_id": blind_stick.device_id},
+            {"_id": 0, "latitude": 1, "longitude": 1, "timestamp": 1, "address": 1, "source": 1, "accuracy": 1}
+        ).sort("timestamp", -1).limit(50))
+        return jsonify({'success': True, 'history': history})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 if __name__ == "__main__":
     blind_stick = SmartBlindStick()
+    blind_stick_thread = threading.Thread(target=blind_stick.run, daemon=True)
+    blind_stick_thread.start()
+    time.sleep(2)
     
     print("\n" + "="*60)
     print("🚀 STARTING FLASK SERVER...")
     print("="*60)
+    print("📱 Open this URL on your MOBILE PHONE:")
     
-    if IS_RENDER:
-        print("☁️ Render Cloud Deployment")
-        print("📱 Open on mobile: https://your-app.onrender.com")
-        print("💻 Open on laptop: https://your-app.onrender.com")
-    else:
-        print(f"📱 Open on mobile: http://{blind_stick.local_ip}:{PORT}")
-        print(f"💻 Open on laptop: http://{blind_stick.local_ip}:{PORT}")
+    hostname = socket.gethostname()
+    local_ip = socket.gethostbyname(hostname)
     
-    print("\n💡 HOW TO USE:")
-    print("   1. Open the URL on your mobile")
-    print("   2. Click 'Start Camera'")
-    print("   3. Grant camera permission")
-    print("   4. Point at objects to detect")
+    print(f"\n   👉 http://{local_ip}:5000")
+    print(f"   👉 http://127.0.0.1:5000 (same computer)")
+    print(f"\n📱 Device ID: {blind_stick.device_id}")
+    print(f"📱 Device Name: {blind_stick.device_name}")
+    print(f"📊 MongoDB: {'✅ Connected' if db is not None else '❌ Disconnected'}")
+    print(f"🌐 IP Address: {blind_stick.local_ip}")
+    
+    print("\n💡 MongoDB Collections:")
+    if db is not None:
+        print(f"   📁 {', '.join(db.list_collection_names())}")
+    print("\n💡 EXACT LOCATION features:")
+    print("   • GPS with High Accuracy (enabled)")
+    print("   • WiFi fallback for indoor locations")
+    print("   • Real-time location tracking with accuracy")
+    print("   • Location history in MongoDB")
+    print("   • Satellite map view with accuracy circle")
+    print("\n💡 Share with others:")
+    print(f"   • Send this link to others: http://{local_ip}:5000")
+    print(f"   • They can view your camera and EXACT location")
     print("="*60 + "\n")
     
     try:
-        # Bind to 0.0.0.0 to accept connections from anywhere
-        app.run(host='0.0.0.0', port=PORT, debug=False, threaded=True)
+        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
         if blind_stick:
-            blind_stick.processing = False
+            blind_stick.cleanup()
