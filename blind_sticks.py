@@ -1,4 +1,4 @@
-# app.py - Complete Working Code with MongoDB Atlas & Live Location
+# blind_sticks.py - Complete Working Code with MongoDB Atlas & Live Location
 import cv2
 import numpy as np
 import threading
@@ -21,6 +21,16 @@ from flask_cors import CORS
 from ultralytics import YOLO
 import pyttsx3
 import math
+
+# ============================================
+# DETECT CLOUD ENVIRONMENT
+# ============================================
+IS_CLOUD = os.environ.get('RENDER', False) or os.environ.get('RAILWAY', False) or os.environ.get('HEROKU', False)
+
+if IS_CLOUD:
+    print("☁️ Running on cloud platform")
+    print("⚠️ Camera will use test pattern mode")
+    print("⚠️ WebSocket may not work on free tier")
 
 # MongoDB Atlas Connection
 try:
@@ -298,8 +308,10 @@ class SmartBlindStick:
         # Load YOLO model
         print("\n📷 Loading YOLO model...")
         try:
-            self.model = YOLO('yolov8n.pt')
-            print("✅ YOLO model loaded!")
+            # Use smaller model for cloud deployment
+            model_name = 'yolov8n.pt'  # Nano model - smallest and fastest
+            self.model = YOLO(model_name)
+            print(f"✅ YOLO model loaded! (Using {model_name})")
         except Exception as e:
             print(f"⚠️ YOLO not available: {e}")
             self.model = None
@@ -310,27 +322,36 @@ class SmartBlindStick:
             7: 'truck', 11: 'stop sign'
         }
         
-        # Camera setup
+        # Camera setup - Skip if on cloud
         print("\n🎥 Opening camera...")
         self.cap = None
-        for i in range(5):
-            cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
-            if not cap.isOpened():
-                cap = cv2.VideoCapture(i)
-            if cap.isOpened():
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-                self.cap = cap
-                print(f"✅ Camera {i} opened successfully!")
-                break
-            else:
-                cap.release()
         
-        if self.cap is None:
-            print("❌ No camera found! Using test pattern.")
+        if IS_CLOUD:
+            print("⚠️ Cloud environment detected - using test pattern")
             self.use_test_pattern = True
         else:
-            self.use_test_pattern = False
+            # Try to open camera normally
+            for i in range(5):
+                try:
+                    cap = cv2.VideoCapture(i, cv2.CAP_DSHOW)
+                    if not cap.isOpened():
+                        cap = cv2.VideoCapture(i)
+                    if cap.isOpened():
+                        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                        self.cap = cap
+                        print(f"✅ Camera {i} opened successfully!")
+                        self.use_test_pattern = False
+                        break
+                    else:
+                        cap.release()
+                except Exception as e:
+                    print(f"⚠️ Camera {i} error: {e}")
+                    continue
+            
+            if self.cap is None:
+                print("❌ No camera found! Using test pattern.")
+                self.use_test_pattern = True
         
         self.clients = set()
         self.current_data = {}
@@ -374,6 +395,7 @@ class SmartBlindStick:
         print(f"   Camera: {'✅ OK' if self.cap else '⚠️ Test Pattern'}")
         print(f"   TTS: {'✅ OK' if self.tts_available else '⚠️ Disabled'}")
         print(f"   MongoDB: {'✅ Connected' if db is not None else '❌ Disabled'}")
+        print(f"   Cloud Mode: {'✅ Enabled' if IS_CLOUD else '❌ Disabled'}")
         print("="*60 + "\n")
     
     def get_local_ip(self):
@@ -554,79 +576,82 @@ class SmartBlindStick:
         if self.model is None:
             return frame, detections
         
-        results = self.model(frame, stream=True, conf=0.5)
-        
-        for r in results:
-            boxes = r.boxes
-            if boxes is not None:
-                for box in boxes:
-                    cls = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    
-                    if conf < 0.5:
-                        continue
-                    
-                    class_name = self.important_classes.get(cls, f"object")
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    
-                    box_height = y2 - y1
-                    
-                    if box_height > height * 0.5:
-                        distance = "very close"
-                        distance_cm = 30
-                        color = (0, 0, 255)
-                    elif box_height > height * 0.3:
-                        distance = "close"
-                        distance_cm = 60
-                        color = (0, 165, 255)
-                    elif box_height > height * 0.15:
-                        distance = "medium"
-                        distance_cm = 120
-                        color = (0, 255, 255)
-                    else:
-                        distance = "far"
-                        distance_cm = 200
-                        color = (0, 255, 0)
-                    
-                    center_x = (x1 + x2) / 2
-                    if center_x < width * 0.3:
-                        direction = "left"
-                    elif center_x > width * 0.7:
-                        direction = "right"
-                    else:
-                        direction = "center"
-                    
-                    detection = {
-                        'class': class_name,
-                        'confidence': conf,
-                        'distance': distance,
-                        'distance_cm': distance_cm,
-                        'direction': direction,
-                        'bbox': (x1, y1, x2, y2)
-                    }
-                    detections.append(detection)
-                    
-                    # Save to MongoDB
-                    self.save_detection_to_db(detection)
-                    
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    label = f"{class_name}: {conf:.2f} ({distance}, {direction})"
-                    cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                    
-                    if class_name == 'person':
-                        if distance == "very close":
-                            self.speak(f"Person {direction}, very close!", 'person')
-                            self.send_arduino_alert('PERSON', distance_cm)
-                        elif distance == "close":
-                            self.speak(f"Person {direction}", 'person')
-                            self.send_arduino_alert('PERSON', distance_cm)
-                        self.detection_count += 1
+        try:
+            results = self.model(frame, stream=True, conf=0.5)
+            
+            for r in results:
+                boxes = r.boxes
+                if boxes is not None:
+                    for box in boxes:
+                        cls = int(box.cls[0])
+                        conf = float(box.conf[0])
                         
-                    elif class_name in ['car', 'truck', 'bus', 'bicycle', 'motorcycle']:
-                        if distance in ["very close", "close"]:
-                            self.speak(f"Vehicle {direction}, {distance}!", 'vehicle')
-                            self.send_arduino_alert('VEHICLE', distance_cm)
-                        self.detection_count += 1
+                        if conf < 0.5:
+                            continue
+                        
+                        class_name = self.important_classes.get(cls, f"object")
+                        x1, y1, x2, y2 = map(int, box.xyxy[0])
+                        
+                        box_height = y2 - y1
+                        
+                        if box_height > height * 0.5:
+                            distance = "very close"
+                            distance_cm = 30
+                            color = (0, 0, 255)
+                        elif box_height > height * 0.3:
+                            distance = "close"
+                            distance_cm = 60
+                            color = (0, 165, 255)
+                        elif box_height > height * 0.15:
+                            distance = "medium"
+                            distance_cm = 120
+                            color = (0, 255, 255)
+                        else:
+                            distance = "far"
+                            distance_cm = 200
+                            color = (0, 255, 0)
+                        
+                        center_x = (x1 + x2) / 2
+                        if center_x < width * 0.3:
+                            direction = "left"
+                        elif center_x > width * 0.7:
+                            direction = "right"
+                        else:
+                            direction = "center"
+                        
+                        detection = {
+                            'class': class_name,
+                            'confidence': conf,
+                            'distance': distance,
+                            'distance_cm': distance_cm,
+                            'direction': direction,
+                            'bbox': (x1, y1, x2, y2)
+                        }
+                        detections.append(detection)
+                        
+                        # Save to MongoDB
+                        self.save_detection_to_db(detection)
+                        
+                        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                        label = f"{class_name}: {conf:.2f} ({distance}, {direction})"
+                        cv2.putText(frame, label, (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                        
+                        if class_name == 'person':
+                            if distance == "very close":
+                                self.speak(f"Person {direction}, very close!", 'person')
+                                self.send_arduino_alert('PERSON', distance_cm)
+                            elif distance == "close":
+                                self.speak(f"Person {direction}", 'person')
+                                self.send_arduino_alert('PERSON', distance_cm)
+                            self.detection_count += 1
+                            
+                        elif class_name in ['car', 'truck', 'bus', 'bicycle', 'motorcycle']:
+                            if distance in ["very close", "close"]:
+                                self.speak(f"Vehicle {direction}, {distance}!", 'vehicle')
+                                self.send_arduino_alert('VEHICLE', distance_cm)
+                            self.detection_count += 1
+        except Exception as e:
+            print(f"⚠️ Detection error: {e}")
         
         return frame, detections
     
@@ -641,8 +666,12 @@ class SmartBlindStick:
                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 cv2.putText(frame, "Waiting for camera...", (200, 240), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                cv2.putText(frame, "Connect a camera to see real-time detection", (120, 280), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                if IS_CLOUD:
+                    cv2.putText(frame, "☁️ Cloud Mode - Test Pattern", (200, 280), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
+                else:
+                    cv2.putText(frame, "Connect a camera to see real-time detection", (120, 280), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
                 detections = []
             else:
                 ret, frame = self.cap.read()
@@ -694,6 +723,10 @@ class SmartBlindStick:
                 cv2.putText(frame, "EMERGENCY MODE ACTIVE", (10, y_offset + 158), 
                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
             
+            if IS_CLOUD:
+                cv2.putText(frame, "☁️ Cloud Mode", (10, y_offset + 178), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 0), 1)
+            
             self.current_data = {
                 'device_id': self.device_id,
                 'device_name': self.device_name,
@@ -707,7 +740,8 @@ class SmartBlindStick:
                 'connected_clients': len(self.clients),
                 'detection_count': self.detection_count,
                 'arduino_connected': self.arduino.connected,
-                'ip_address': self.local_ip
+                'ip_address': self.local_ip,
+                'cloud_mode': IS_CLOUD
             }
             
             frame = np.ascontiguousarray(frame)
@@ -787,13 +821,17 @@ class SmartBlindStick:
     async def broadcast_updates(self):
         while True:
             if self.clients and self.current_data:
+                # Create a copy to avoid modification during iteration
+                clients_copy = list(self.clients)
                 dead = set()
-                for client in self.clients:
+                for client in clients_copy:
                     try:
                         await client.send(json.dumps(self.current_data))
                     except:
                         dead.add(client)
-                self.clients -= dead
+                # Remove dead clients after iteration
+                if dead:
+                    self.clients -= dead
             await asyncio.sleep(0.1)
     
     def run_websocket(self):
@@ -802,11 +840,20 @@ class SmartBlindStick:
         self.ws_loop = loop
         
         async def server():
-            async with websockets.serve(self.handle_client, '0.0.0.0', 8765):
-                print("🔌 WebSocket server running on ws://0.0.0.0:8765")
-                await asyncio.gather(self.broadcast_updates(), asyncio.Future())
+            try:
+                async with websockets.serve(self.handle_client, '0.0.0.0', 8765):
+                    print("🔌 WebSocket server running on ws://0.0.0.0:8765")
+                    await asyncio.gather(self.broadcast_updates(), asyncio.Future())
+            except Exception as e:
+                print(f"⚠️ WebSocket server error: {e}")
+                print("   WebSocket may not be supported on this platform")
         
-        loop.run_until_complete(server())
+        try:
+            loop.run_until_complete(server())
+        except Exception as e:
+            print(f"⚠️ WebSocket error: {e}")
+        finally:
+            loop.close()
     
     async def send_emergency(self, location, person_count):
         maps_url = f"https://www.google.com/maps?q={location['lat']},{location['lng']}"
@@ -892,6 +939,7 @@ class SmartBlindStick:
         print(f"📱 Device ID: {self.device_id}")
         print(f"📱 Device Name: {self.device_name}")
         print(f"📊 MongoDB: {'✅ Connected' if db is not None else '❌ Disabled'}")
+        print(f"☁️ Cloud Mode: {'✅ Enabled' if IS_CLOUD else '❌ Disabled'}")
         print("\n💡 TIPS:")
         print("   • All detections and alerts are saved to MongoDB Atlas")
         print("   • EXACT LOCATION tracking with GPS + WiFi fallback")
@@ -1710,9 +1758,7 @@ def index():
 def video_feed():
     if blind_stick:
         return Response(blind_stick.generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
-    return "Camera not initialized", 500
-
-@app.route('/stats')
+    return "Camera not initialized", 500@app.route('/stats')
 def stats():
     if blind_stick:
         return jsonify({
@@ -1727,7 +1773,8 @@ def stats():
             'device_id': blind_stick.device_id,
             'device_name': blind_stick.device_name,
             'ip_address': blind_stick.local_ip,
-            'location_updates': blind_stick.location_update_count
+            'location_updates': blind_stick.location_update_count,
+            'cloud_mode': IS_CLOUD
         })
     return jsonify({'connected_clients': 0, 'person_count': 0, 'fps': 0})
 
@@ -1769,26 +1816,42 @@ def get_location_history():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
+# ============================================
+# HEALTH CHECK ENDPOINT FOR DEPLOYMENT
+# ============================================
+@app.route('/health')
+def health():
+    return jsonify({
+        'status': 'healthy',
+        'device_id': blind_stick.device_id if blind_stick else None,
+        'mongodb_connected': db is not None,
+        'cloud_mode': IS_CLOUD,
+        'timestamp': datetime.now().isoformat()
+    })
+
+# ============================================
+# MAIN ENTRY POINT
+# ============================================
 if __name__ == "__main__":
     blind_stick = SmartBlindStick()
     blind_stick_thread = threading.Thread(target=blind_stick.run, daemon=True)
     blind_stick_thread.start()
     time.sleep(2)
     
+    # Get port from environment (Render sets PORT)
+    port = int(os.environ.get('PORT', 5000))
+    host = '0.0.0.0'
+    
     print("\n" + "="*60)
     print("🚀 STARTING FLASK SERVER...")
     print("="*60)
-    print("📱 Open this URL on your MOBILE PHONE:")
-    
-    hostname = socket.gethostname()
-    local_ip = socket.gethostbyname(hostname)
-    
-    print(f"\n   👉 http://{local_ip}:5000")
-    print(f"   👉 http://127.0.0.1:5000 (same computer)")
+    print(f"📱 Open this URL:")
+    print(f"   👉 http://{host}:{port}")
     print(f"\n📱 Device ID: {blind_stick.device_id}")
     print(f"📱 Device Name: {blind_stick.device_name}")
     print(f"📊 MongoDB: {'✅ Connected' if db is not None else '❌ Disconnected'}")
     print(f"🌐 IP Address: {blind_stick.local_ip}")
+    print(f"☁️ Cloud Mode: {'✅ Enabled' if IS_CLOUD else '❌ Disabled'}")
     
     print("\n💡 MongoDB Collections:")
     if db is not None:
@@ -1800,12 +1863,12 @@ if __name__ == "__main__":
     print("   • Location history in MongoDB")
     print("   • Satellite map view with accuracy circle")
     print("\n💡 Share with others:")
-    print(f"   • Send this link to others: http://{local_ip}:5000")
+    print(f"   • Send this link to others: http://{host}:{port}")
     print(f"   • They can view your camera and EXACT location")
     print("="*60 + "\n")
     
     try:
-        app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)
+        app.run(host=host, port=port, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
         if blind_stick:
