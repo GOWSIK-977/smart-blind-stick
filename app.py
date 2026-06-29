@@ -1,4 +1,4 @@
-# blind_sticks.py - Complete Working Code with MongoDB Atlas & Live Location
+# blind_sticks.py - Fixed for Gunicorn
 import cv2
 import numpy as np
 import threading
@@ -308,8 +308,14 @@ class SmartBlindStick:
         # Load YOLO model
         print("\n📷 Loading YOLO model...")
         try:
-            # Use smaller model for cloud deployment
-            model_name = 'yolov8n.pt'  # Nano model - smallest and fastest
+            import torch
+            # Fix for PyTorch 2.6+
+            try:
+                from ultralytics.nn.tasks import DetectionModel
+                torch.serialization.add_safe_globals([DetectionModel])
+            except:
+                pass
+            model_name = 'yolov8n.pt'
             self.model = YOLO(model_name)
             print(f"✅ YOLO model loaded! (Using {model_name})")
         except Exception as e:
@@ -1748,7 +1754,14 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 </html>
 '''
 
-blind_stick = None
+# ============================================
+# CREATE blind_stick GLOBALLY FOR GUNICORN
+# ============================================
+# Initialize blind_stick when app starts
+blind_stick = SmartBlindStick()
+
+# Start WebSocket thread
+blind_stick.run()
 
 @app.route('/')
 def index():
@@ -1758,7 +1771,9 @@ def index():
 def video_feed():
     if blind_stick:
         return Response(blind_stick.generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
-    return "Camera not initialized", 500@app.route('/stats')
+    return "Camera not initialized", 500
+
+@app.route('/stats')
 def stats():
     if blind_stick:
         return jsonify({
@@ -1830,15 +1845,10 @@ def health():
     })
 
 # ============================================
-# MAIN ENTRY POINT
+# MAIN ENTRY POINT (for local development)
 # ============================================
 if __name__ == "__main__":
-    blind_stick = SmartBlindStick()
-    blind_stick_thread = threading.Thread(target=blind_stick.run, daemon=True)
-    blind_stick_thread.start()
-    time.sleep(2)
-    
-    # Get port from environment (Render sets PORT)
+    # Get port from environment
     port = int(os.environ.get('PORT', 5000))
     host = '0.0.0.0'
     
@@ -1850,21 +1860,7 @@ if __name__ == "__main__":
     print(f"\n📱 Device ID: {blind_stick.device_id}")
     print(f"📱 Device Name: {blind_stick.device_name}")
     print(f"📊 MongoDB: {'✅ Connected' if db is not None else '❌ Disconnected'}")
-    print(f"🌐 IP Address: {blind_stick.local_ip}")
     print(f"☁️ Cloud Mode: {'✅ Enabled' if IS_CLOUD else '❌ Disabled'}")
-    
-    print("\n💡 MongoDB Collections:")
-    if db is not None:
-        print(f"   📁 {', '.join(db.list_collection_names())}")
-    print("\n💡 EXACT LOCATION features:")
-    print("   • GPS with High Accuracy (enabled)")
-    print("   • WiFi fallback for indoor locations")
-    print("   • Real-time location tracking with accuracy")
-    print("   • Location history in MongoDB")
-    print("   • Satellite map view with accuracy circle")
-    print("\n💡 Share with others:")
-    print(f"   • Send this link to others: http://{host}:{port}")
-    print(f"   • They can view your camera and EXACT location")
     print("="*60 + "\n")
     
     try:

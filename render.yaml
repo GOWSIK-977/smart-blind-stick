@@ -2,14 +2,19 @@ services:
   - type: web
     name: smart-blind-stick
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
-    envVars:
-      - key: MONGO_URI
-        value: mongodb+srv://gowsik977_db_user:gowsik123@cluster1.t4w8mul.mongodb.net/?appName=Cluster1
-      - key: PYTHON_VERSION
-        value: 3.11.0
-      - key: RENDER
-        value: true
     plan: free
+
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: python app.py
+
     healthCheckPath: /health
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.9
+
+      - key: RENDER
+        value: "true"
+
+      - key: MONGO_URI
+        sync: false
