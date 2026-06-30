@@ -1917,7 +1917,7 @@ def health():
 # MAIN ENTRY POINT (for local development)
 # ============================================
 if __name__ == "__main__":
-    # Get port from environment (Render sets PORT=10000)
+    # For local development only
     port = int(os.environ.get('PORT', 5000))
     host = '0.0.0.0'
     
@@ -1933,7 +1933,6 @@ if __name__ == "__main__":
     print("="*60 + "\n")
     
     try:
-        # Bind to all interfaces on the specified port
         app.run(host=host, port=port, debug=False, threaded=True)
     except KeyboardInterrupt:
         print("\n🛑 Shutting down...")
