@@ -1,10 +1,8 @@
 # gunicorn.conf.py
 import os
-import multiprocessing
 
-# Bind to port from environment
-port = os.environ.get('PORT', '10000')
-bind = f"0.0.0.0:{port}"
+# Force bind to port 10000 (Render's default)
+bind = "0.0.0.0:10000"
 
 # Worker configuration
 workers = 1
@@ -20,9 +18,6 @@ preload_app = True
 limit_request_line = 4094
 limit_request_fields = 100
 limit_request_field_size = 8190
-
-# Use /dev/shm for temp files (if available)
-worker_tmp_dir = '/dev/shm'
 
 # Logging
 accesslog = '-'
