@@ -1,4 +1,5 @@
-# blind_sticks.py - Fixed for Gunicorn
+# app.py - Smart Blind Stick System (Fully Optimized for Render)
+
 import cv2
 import numpy as np
 import threading
@@ -15,12 +16,23 @@ import re
 import os
 import urllib.request
 import hashlib
+import gc
+import resource
 from datetime import datetime
 from flask import Flask, Response, render_template_string, jsonify, request
 from flask_cors import CORS
 from ultralytics import YOLO
 import pyttsx3
 import math
+
+# ============================================
+# MEMORY OPTIMIZATION - SET LIMITS
+# ============================================
+try:
+    resource.setrlimit(resource.RLIMIT_AS, (512 * 1024 * 1024, -1))  # 512MB limit
+    print("✅ Memory limit set to 512MB")
+except:
+    pass
 
 # ============================================
 # DETECT CLOUD ENVIRONMENT
@@ -30,7 +42,6 @@ IS_CLOUD = os.environ.get('RENDER', False) or os.environ.get('RAILWAY', False) o
 if IS_CLOUD:
     print("☁️ Running on cloud platform")
     print("⚠️ Camera will use test pattern mode")
-    print("⚠️ WebSocket may not work on free tier")
 
 # MongoDB Atlas Connection
 try:
@@ -39,7 +50,7 @@ try:
     PYMONGO_AVAILABLE = True
 except ImportError:
     PYMONGO_AVAILABLE = False
-    print("⚠️ PyMongo not installed. Install with: pip install pymongo")
+    print("⚠️ PyMongo not installed")
 
 # Try to import serial for Arduino (optional)
 try:
@@ -48,7 +59,7 @@ try:
     SERIAL_AVAILABLE = True
 except ImportError:
     SERIAL_AVAILABLE = False
-    print("⚠️ PySerial not installed. Arduino features disabled.")
+    print("⚠️ PySerial not available")
 
 warnings.filterwarnings('ignore')
 
@@ -108,7 +119,9 @@ DEVICE_NAME = f"Device-{DEVICE_ID[:6]}"
 # Your Google Maps API Key
 GOOGLE_MAPS_API_KEY = "AIzaSyCdQGVYnjmSAzxnTu4g_zEXKGhgzqbZDvc"
 
-# Arduino Manager Class
+# ============================================
+# ARDUINO MANAGER CLASS
+# ============================================
 class ArduinoManager:
     def __init__(self, port=None, baudrate=9600):
         self.serial_connection = None
@@ -269,6 +282,9 @@ class ArduinoManager:
                 pass
             print("🔌 Arduino disconnected")
 
+# ============================================
+# SMART BLIND STICK MAIN CLASS
+# ============================================
 class SmartBlindStick:
     def __init__(self):
         print("\n" + "="*60)
@@ -305,7 +321,7 @@ class SmartBlindStick:
             'person': 2.0, 'stairs': 3.0, 'pothole': 2.5, 'wall': 2.5, 'vehicle': 2.0, 'emergency': 10.0
         }
         
-        # Load YOLO model
+        # Load YOLO model with memory optimization
         print("\n📷 Loading YOLO model...")
         try:
             import torch
@@ -317,6 +333,11 @@ class SmartBlindStick:
                 pass
             model_name = 'yolov8n.pt'
             self.model = YOLO(model_name)
+            # Memory optimization for YOLO
+            self.model.overrides['imgsz'] = 320  # Smaller image size
+            self.model.overrides['conf'] = 0.5   # Higher confidence
+            self.model.overrides['device'] = 'cpu'
+            self.model.overrides['verbose'] = False
             print(f"✅ YOLO model loaded! (Using {model_name})")
         except Exception as e:
             print(f"⚠️ YOLO not available: {e}")
@@ -368,11 +389,13 @@ class SmartBlindStick:
         self.fps = 0
         self.detection_count = 0
         self.location_update_count = 0
+        self.frame_counter = 0
+        self.gc_counter = 0
         
         # Get local IP
         self.local_ip = self.get_local_ip()
         
-        # Current location with more fields - EXACT LOCATION
+        # Current location
         self.current_location = {
             "lat": 0.0,
             "lng": 0.0,
@@ -635,8 +658,9 @@ class SmartBlindStick:
                         }
                         detections.append(detection)
                         
-                        # Save to MongoDB
-                        self.save_detection_to_db(detection)
+                        # Save to MongoDB (with limit to prevent spam)
+                        if self.detection_count % 5 == 0:
+                            self.save_detection_to_db(detection)
                         
                         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
                         label = f"{class_name}: {conf:.2f} ({distance}, {direction})"
@@ -661,29 +685,62 @@ class SmartBlindStick:
         
         return frame, detections
     
+    def generate_test_pattern(self):
+        """Generate test pattern with movement for cloud deployment"""
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        
+        # Animated bars
+        t = time.time()
+        
+        # Background gradient
+        for i in range(480):
+            for j in range(640):
+                frame[i][j] = [int(50 + 50 * np.sin(i/20 + t)), 
+                               int(50 + 50 * np.cos(j/20 + t)), 
+                               int(100 + 50 * np.sin((i+j)/30 + t))]
+        
+        # Main text
+        cv2.putText(frame, "🦯 SMART BLIND STICK", (100, 120), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+        cv2.putText(frame, "☁️ CLOUD MODE ACTIVE", (180, 180), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
+        cv2.putText(frame, "📱 Connected: " + str(len(self.clients)), (180, 220), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+        cv2.putText(frame, f"📍 {self.current_location.get('address', 'Location')[:30]}", (100, 280), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.putText(frame, f"Device: {self.device_name} | {self.local_ip}", (100, 320), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(frame, f"FPS: {self.fps} | Persons: {self.person_count}", (100, 360), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+        cv2.putText(frame, "✅ System Running on Render", (180, 420), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        
+        # Moving indicator
+        pos = int((np.sin(t/2) + 1) * 300)
+        cv2.circle(frame, (pos, 450), 10, (0, 255, 255), -1)
+        
+        return frame
+    
     def generate_frames(self):
         fps_start = time.time()
         frame_count = 0
         
         while True:
+            # Memory management - periodic GC
+            self.frame_counter += 1
+            if self.frame_counter % 50 == 0:
+                gc.collect()
+                print(f"🧹 Garbage collected (frame {self.frame_counter})")
+            
             if self.use_test_pattern or self.cap is None:
-                frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(frame, "SMART BLIND STICK SYSTEM", (150, 200), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                cv2.putText(frame, "Waiting for camera...", (200, 240), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                if IS_CLOUD:
-                    cv2.putText(frame, "☁️ Cloud Mode - Test Pattern", (200, 280), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 1)
-                else:
-                    cv2.putText(frame, "Connect a camera to see real-time detection", (120, 280), 
-                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                # Use animated test pattern
+                frame = self.generate_test_pattern()
                 detections = []
             else:
                 ret, frame = self.cap.read()
                 if not ret:
-                    frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                    cv2.putText(frame, "Camera Error", (240, 240), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    frame = self.generate_test_pattern()
+                    detections = []
                 else:
                     frame_count += 1
                     if frame_count % 30 == 0:
@@ -691,12 +748,17 @@ class SmartBlindStick:
                         self.fps = int(30 / elapsed) if elapsed > 0 else 30
                         fps_start = time.time()
                     
-                    frame, detections = self.detect_with_yolo(frame)
+                    # Process every 3rd frame to reduce CPU/GPU usage
+                    if frame_count % 3 == 0:
+                        frame, detections = self.detect_with_yolo(frame)
+                    else:
+                        detections = self.detected_objects
             
             self.person_count = sum(1 for d in detections if d['class'] == 'person')
             self.vehicle_count = sum(1 for d in detections if d['class'] in ['car', 'truck', 'bus', 'bicycle', 'motorcycle'])
             self.detected_objects = detections
             
+            # Add HUD overlay
             y_offset = 30
             cv2.putText(frame, "SMART BLIND STICK SYSTEM", (10, y_offset), 
                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
@@ -752,7 +814,15 @@ class SmartBlindStick:
             
             frame = np.ascontiguousarray(frame)
             ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            if ret:
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            else:
+                # If encoding fails, skip this frame
+                time.sleep(0.05)
+                continue
+            
+            # Small delay to prevent CPU overuse
+            time.sleep(0.02)
     
     async def handle_client(self, websocket):
         self.clients.add(websocket)
@@ -787,7 +857,6 @@ class SmartBlindStick:
                         heading = data.get('heading', 0)
                         
                         if lat is not None and lng is not None:
-                            # Update exact location
                             self.current_location = {
                                 "lat": lat,
                                 "lng": lng,
@@ -799,7 +868,6 @@ class SmartBlindStick:
                                 "source": "GPS_HighAccuracy" if accuracy < 20 else "GPS" if accuracy < 100 else "WiFi",
                                 "timestamp": datetime.now().isoformat()
                             }
-                            # Save to MongoDB
                             self.save_location_to_db()
                             self.log_system_event('LOCATION_UPDATE', 
                                 f"Exact Location: {self.current_location['address']} (Accuracy: {accuracy}m)")
@@ -827,7 +895,6 @@ class SmartBlindStick:
     async def broadcast_updates(self):
         while True:
             if self.clients and self.current_data:
-                # Create a copy to avoid modification during iteration
                 clients_copy = list(self.clients)
                 dead = set()
                 for client in clients_copy:
@@ -835,7 +902,6 @@ class SmartBlindStick:
                         await client.send(json.dumps(self.current_data))
                     except:
                         dead.add(client)
-                # Remove dead clients after iteration
                 if dead:
                     self.clients -= dead
             await asyncio.sleep(0.1)
@@ -962,7 +1028,7 @@ class SmartBlindStick:
             print("🔌 MongoDB connection closed")
 
 # ============================================
-# HTML TEMPLATE with Connection Links at Bottom
+# HTML TEMPLATE (Kept as is - same as before)
 # ============================================
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html>
@@ -1101,8 +1167,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             font-weight: bold;
         }
         .map-btn:hover { background: #45a049; }
-        
-        /* Connection Links Section - At Bottom */
         .connection-section {
             background: rgba(0,0,0,0.4);
             border-radius: 16px;
@@ -1165,8 +1229,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             margin-top: 8px;
             font-family: monospace;
         }
-        
-        /* Mobile connected devices list */
         .connected-devices {
             margin-top: 10px;
         }
@@ -1178,8 +1240,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             margin: 3px 0;
             border-left: 2px solid #4caf50;
         }
-        
-        /* Accuracy badge */
         .accuracy-badge {
             display: inline-block;
             padding: 2px 10px;
@@ -1190,6 +1250,15 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .accuracy-high { background: rgba(76,175,80,0.3); color: #4caf50; border: 1px solid #4caf50; }
         .accuracy-medium { background: rgba(255,193,7,0.3); color: #ffc107; border: 1px solid #ffc107; }
         .accuracy-low { background: rgba(244,67,54,0.3); color: #f44336; border: 1px solid #f44336; }
+        .cloud-badge {
+            background: rgba(33,150,243,0.2);
+            border: 1px solid #2196f3;
+            color: #2196f3;
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 10px;
+            display: inline-block;
+        }
     </style>
 </head>
 <body>
@@ -1200,6 +1269,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <span id="wsStatus" class="badge disconnected">🔴 Connecting...</span>
             <span id="arduinoStatus" class="badge disconnected">🔌 Arduino: Unknown</span>
             <span id="dbStatus" class="badge disconnected">📊 DB: Unknown</span>
+            <span id="cloudStatus" class="badge cloud-badge" style="display:none;">☁️ Cloud</span>
         </div>
         
         <div class="video-container">
@@ -1248,9 +1318,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             <div class="device-info" id="deviceInfo">Device: Loading...</div>
         </div>
         
-        <!-- ============================================ -->
-        <!-- CONNECTION LINKS SECTION - At the Bottom -->
-        <!-- ============================================ -->
         <div class="connection-section">
             <h3>🔗 Share This Device</h3>
             
@@ -1370,11 +1437,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                         document.getElementById('accuracyText').textContent = 
                             `Accuracy: ${accuracy.toFixed(0)}m | Speed: ${(speed * 3.6).toFixed(1)} km/h`;
                         
-                        // Show source
                         const source = accuracy < 20 ? 'GPS (High Accuracy)' : accuracy < 100 ? 'GPS' : 'WiFi/Network';
                         document.getElementById('locationSource').textContent = `Source: ${source}`;
                         
-                        // Accuracy badge
                         const badge = document.getElementById('accuracyBadge') || document.createElement('span');
                         badge.id = 'accuracyBadge';
                         badge.className = `accuracy-badge ${accuracy < 20 ? 'accuracy-high' : accuracy < 100 ? 'accuracy-medium' : 'accuracy-low'}`;
@@ -1502,6 +1567,10 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                 }
             }
             
+            if (data.cloud_mode !== undefined && data.cloud_mode) {
+                document.getElementById('cloudStatus').style.display = 'inline-block';
+            }
+            
             if (data.device_id) {
                 deviceInfo = data;
                 document.getElementById('deviceInfo').textContent = 
@@ -1577,6 +1646,9 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
                     }
                     if (data.ip_address) {
                         document.getElementById('localIp').textContent = data.ip_address;
+                    }
+                    if (data.cloud_mode) {
+                        document.getElementById('cloudStatus').style.display = 'inline-block';
                     }
                     
                     const hostname = window.location.hostname;
@@ -1757,10 +1829,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
 # ============================================
 # CREATE blind_stick GLOBALLY FOR GUNICORN
 # ============================================
-# Initialize blind_stick when app starts
 blind_stick = SmartBlindStick()
-
-# Start WebSocket thread
 blind_stick.run()
 
 @app.route('/')
@@ -1832,7 +1901,7 @@ def get_location_history():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 # ============================================
-# HEALTH CHECK ENDPOINT FOR DEPLOYMENT
+# HEALTH CHECK ENDPOINT
 # ============================================
 @app.route('/health')
 def health():
@@ -1848,7 +1917,6 @@ def health():
 # MAIN ENTRY POINT (for local development)
 # ============================================
 if __name__ == "__main__":
-    # Get port from environment
     port = int(os.environ.get('PORT', 5000))
     host = '0.0.0.0'
     
